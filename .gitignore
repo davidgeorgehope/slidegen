@@ -1,0 +1,34 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Private source material and generated artifacts
+images/
+specs/
+extracted/
+output/
+*.pptx
+*.ppt
+*.key
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# Local/private templates
+*Template*.pptx
+
+# Local experiments and slide-specific scripts from private workspaces
+src/render.py
+src/render_image*.py
+src/extract_image*_assets.py
+src/extract_bbox_assets.py
+src/extract_chips.py
+src/extract_logos.py
+src/extract_logos_grid.py
