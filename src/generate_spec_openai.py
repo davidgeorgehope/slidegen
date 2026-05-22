@@ -24,7 +24,7 @@ except ImportError as exc:  # pragma: no cover - dependency error path
 
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_DIR = ROOT / "prompts" / "spec_generation"
-DEFAULT_SPEC_MODEL = "gpt-5.4-mini"
+DEFAULT_SPEC_MODEL = "gpt-5.5"
 DEFAULT_THEME = {
     "bg_color": "F7FBFE",
     "panel_fill": "FFFFFF",

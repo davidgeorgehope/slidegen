@@ -5,10 +5,11 @@ Convert slide screenshots or PNG exports into editable PowerPoint decks.
 The project is intentionally spec-driven:
 
 1. Read a source image.
-2. Use OCR and/or an OpenAI vision model to draft a JSON slide spec.
-3. Extract real source logos/assets from OCR anchors.
-4. Generate only generic, text-free pictograms when allowed.
-5. Render editable `.pptx` files with native text, shapes, connectors, and images.
+2. Use Apple Vision OCR on macOS to collect text and bounding boxes.
+3. Send the source image plus OCR context to an OpenAI vision model to draft a JSON slide spec.
+4. Extract real source logos/assets from OCR anchors.
+5. Generate only generic, text-free pictograms when allowed.
+6. Render editable `.pptx` files with native text, shapes, connectors, and images.
 
 The source image is treated as evidence, not as the slide background.
 
@@ -73,10 +74,30 @@ python3 -m venv .venv
 For OpenAI-backed spec generation, create a local `.env` file:
 
 ```bash
-OPENAI_SPEC_MODEL=gpt-5.4-mini
+OPENAI_SPEC_MODEL=gpt-5.5
 ```
 
 Set `OPENAI_API_KEY` in that local `.env` file. `.env` is ignored by git.
+
+## Spec Generation Model
+
+`gpt-5.5` is the default model for spec generation. You can override it per run:
+
+```bash
+.venv/bin/python src/run_pipeline.py \
+  images/source.png \
+  specs/source.auto.json \
+  output/source.pptx \
+  --generate-spec \
+  --force-spec \
+  --spec-model gpt-5.5
+```
+
+The spec generator is not OpenAI OCR only. By default it uses Apple Vision OCR
+locally when running on macOS, then sends both the image and the OCR boxes to
+OpenAI. If Apple Vision is unavailable, the OpenAI call still receives the image
+and the OCR context says it was unavailable. Use `--no-ocr` on
+`src/generate_spec_openai.py` to intentionally skip local OCR.
 
 ## One-Command Flow
 
@@ -91,7 +112,7 @@ Set `OPENAI_API_KEY` in that local `.env` file. `.env` is ignored by git.
 
 This will:
 
-1. Generate a JSON spec from the image and OCR context.
+1. Generate a JSON spec from the image and Apple Vision OCR context.
 2. Extract declared logo assets from the source image.
 3. Verify the generated spec and print non-fatal warnings.
 4. Render an editable `.pptx`.
