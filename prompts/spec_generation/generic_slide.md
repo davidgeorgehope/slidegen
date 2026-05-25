@@ -66,12 +66,13 @@ For normal source images, emit one `generic_slide`:
   "asset_queries": [
     {
       "name": "secure_browser_icon",
+      "icon_id": "secure_browser",
+      "icon_style": "blue_line",
       "semantic_label": "secure browser session",
       "generatable": true,
       "anchor_text": "Browser session",
       "crop_rule": "nearest_icon_left",
-      "bbox": [92, 275, 54, 54],
-      "generation_prompt": "Create a simple text-free enterprise security pictogram for a secure browser session. Clean vector-like blue line art, centered, generous padding, flat #00ff00 chroma-key background. No words, letters, logos, watermark, shadows, or gradient background."
+      "bbox": [92, 275, 54, 54]
     }
   ],
   "assets": {}
@@ -133,9 +134,21 @@ Field guidance:
   `browser isolation`, `user group`, `policy engine`, `risk signal`,
   `SaaS connector`, `ticket workflow`, `audit evidence`, `device posture`.
 - For generic non-brand icons, add an `asset_queries` item with
-  `generatable: true`. Image generation is the primary path when
-  `OPENAI_API_KEY` exists; the `anchor_text`, `crop_rule`, and `bbox` fields
-  give a Vision/source-crop fallback.
+  `generatable: true`. Include a stable `icon_id` and `icon_style`; the model
+  should do the semantic normalization, not the renderer. Reuse the same
+  `icon_id` for the same concept across slides, for example `api_key`,
+  `oauth_client`, `service_account`, `user_group`, `shield_check`,
+  `document_search`, or `target_crosshair`.
+- `icon_style` must be one of `blue_line`, `blue_fill`, `white_line`,
+  `white_on_blue`, `status_check`, or `status_error`. Use `blue_line` for most
+  icons, `white_line`/`white_on_blue` for dark or blue containers, and status
+  styles only for check/error markers.
+- Image generation is the primary path for generic icons when `OPENAI_API_KEY`
+  exists; the `anchor_text`, `crop_rule`, and `bbox` fields give a
+  Vision/source-crop fallback.
+- Do not emit per-icon `generation_prompt` text. The asset pipeline builds a
+  standardized prompt from `icon_id`, `icon_style`, and `semantic_label` so the
+  icon library remains consistent.
 - Do not generate real vendor, customer, product, or brand logos. Put those in
   `logo_assets` with visible OCR text in `match`.
 - Use `type: "image"` only for non-editable source visual material that should

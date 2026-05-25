@@ -8,7 +8,7 @@ The project is intentionally spec-driven:
 2. Use Apple Vision OCR on macOS to collect text and bounding boxes.
 3. Send the source image plus OCR context to an OpenAI vision model to draft a JSON slide spec.
 4. Extract real source logos/assets from OCR anchors.
-5. Generate only generic, text-free pictograms when allowed.
+5. Generate or reuse canonical generic, text-free pictograms when allowed.
 6. Render editable `.pptx` files with native text, shapes, connectors, and images.
 
 The source image is treated as evidence, not as the slide background.
@@ -166,14 +166,12 @@ deck:
   --spec-dir specs/auto \
   --output-dir output/auto \
   --combined output/all_slides_auto.pptx \
-  --skip-generic-assets \
   --force-spec
 ```
 
-`--skip-generic-assets` is the native-first mode: real logos are extracted from
-the source image, but generic icons are drawn with editable PowerPoint shapes
-instead of source crops or image generation. Drop that flag when you want the
-asset pipeline to generate/extract generic icons too.
+For a fast layout-QA pass without generated/cropped generic icons, add
+`--skip-generic-assets`. In that mode real logos are still extracted, but
+generic icons are drawn with editable placeholder PowerPoint shapes.
 
 Useful narrower runs:
 
@@ -204,12 +202,21 @@ Use this order:
 
 1. Template/master assets for brand marks and recurring design assets.
 2. Source crops or a logo library for real vendor/customer logos.
-3. Generated assets for generic, non-brand, text-free pictograms marked as
-   generatable when an OpenAI key is available.
-4. Vision/OpenCV source crops as the fallback for those generic pictograms when
-   generation is unavailable or fails.
+3. A generated icon library for generic, non-brand, text-free pictograms. The
+   spec LLM emits stable `icon_id` and `icon_style` fields; the asset pipeline
+   generates each concept/style once and reuses it across slides. Existing
+   library icons can be reused without an API key.
+4. Vision/OpenCV source crops as fallback for generic pictograms when generation
+   is unavailable, disabled, or fails. Crop quality checks reject obviously bad
+   icon crops.
+5. Native PowerPoint placeholder icons only for layout QA or missing assets.
 
 Image generation is not used to create full slides, charts, tables, real logos, or editable labels.
+The asset code does not infer icon meaning from regexes or alias tables. The
+spec LLM owns semantic normalization by emitting `icon_id`; if that field is
+missing, the asset pipeline only falls back to the asset name. The generic icon
+generation prompt is centralized in `src/extract_assets_vision.py` so repeated
+concepts stay visually consistent across slides.
 
 ## Security Notes
 

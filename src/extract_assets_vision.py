@@ -43,6 +43,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from extract_logos_vision import (
     OCRBox,
@@ -59,11 +60,66 @@ MIN_COMPONENT_AREA = 8
 CLUSTER_GAP = 14
 CROP_PAD = 6
 IMAGE_GEN_CLI = Path.home() / ".codex/skills/.system/imagegen/scripts/image_gen.py"
-GENERATED_CACHE_DIR = Path("extracted") / "generated_cache"
+GENERATED_ICON_LIBRARY_DIR = Path("extracted") / "generated_icon_library"
+VALID_ICON_STYLES = {"blue_line", "blue_fill", "white_line", "white_on_blue", "status_check", "status_error"}
+ICON_PROMPT_VERSION = "v2"
+CHROMA_KEY_HEX = "#ff00ff"
+CHROMA_KEY_COLORS = ((255, 0, 255), (0, 255, 0))
+CHROMA_BORDER_DELTA = 80
+CHROMA_REMOVE_DELTA = 128
+
+
+@dataclass(frozen=True)
+class CropQuality:
+    ok: bool
+    reason: str
+    metrics: dict[str, float]
 
 
 def normalize(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def slug(value: str) -> str:
+    chars = []
+    previous_underscore = False
+    for char in value.lower():
+        if char.isalnum():
+            chars.append(char)
+            previous_underscore = False
+        elif not previous_underscore:
+            chars.append("_")
+            previous_underscore = True
+    parts = "".join(chars).strip("_").split("_")
+    return "_".join(part for part in parts[:6] if part)
+
+
+def semantic_icon(query: dict) -> tuple[str, str]:
+    """Return the LLM-provided canonical icon id and human label.
+
+    The spec generator is responsible for semantic normalization. This fallback
+    is deliberately dumb so we do not grow a hidden rules engine here.
+    """
+    icon_id = slug(str(query.get("icon_id") or query.get("canonical_icon") or query.get("name") or "generic_icon"))
+    if icon_id.endswith("_icon"):
+        icon_id = icon_id[:-5]
+    label = str(query.get("semantic_label") or icon_id.replace("_", " ")).strip()
+    return icon_id or "generic_icon", label
+
+
+def icon_style(query: dict) -> str:
+    explicit = str(query.get("icon_style") or query.get("style") or "").strip().lower().replace("-", "_")
+    if explicit in VALID_ICON_STYLES:
+        return explicit
+    return "blue_line"
+
+
+def bool_value(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
 
 
 def expand_bbox(bbox: tuple[int, int, int, int], pad: int, img: np.ndarray) -> tuple[int, int, int, int]:
@@ -279,6 +335,66 @@ def query_bbox_crop(query: dict, img: np.ndarray):
     return expand_bbox((x, y, w, h), int(query.get("pad", CROP_PAD)), img)
 
 
+def intersection_area(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> int:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x0 = max(ax, bx)
+    y0 = max(ay, by)
+    x1 = min(ax + aw, bx + bw)
+    y1 = min(ay + ah, by + bh)
+    if x1 <= x0 or y1 <= y0:
+        return 0
+    return int((x1 - x0) * (y1 - y0))
+
+
+def foreground_ratio(crop: np.ndarray) -> float:
+    if crop.size == 0:
+        return 0.0
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    sat = hsv[..., 1]
+    val = hsv[..., 2]
+    mask = ((sat > SAT_MIN) | (val < VAL_MAX)).astype(np.uint8)
+    return float(mask.mean())
+
+
+def assess_crop_quality(
+    bbox: tuple[int, int, int, int],
+    crop: np.ndarray,
+    *,
+    query: dict,
+    img: np.ndarray,
+    ocr_boxes: list[OCRBox] | None = None,
+) -> CropQuality:
+    x, y, w, h = bbox
+    area = max(1, w * h)
+    metrics = {
+        "width": float(w),
+        "height": float(h),
+        "area_ratio": float(area / max(1, img.shape[0] * img.shape[1])),
+        "aspect": float(w / max(1, h)),
+        "foreground_ratio": foreground_ratio(crop),
+        "ocr_overlap_ratio": 0.0,
+    }
+
+    if bool_value(query.get("generatable", False)):
+        if w < 12 or h < 12:
+            return CropQuality(False, "crop too small for an icon", metrics)
+        if w > 220 or h > 220:
+            return CropQuality(False, "crop too large for an icon", metrics)
+        if metrics["aspect"] < 0.25 or metrics["aspect"] > 4.0:
+            return CropQuality(False, "crop aspect ratio is implausible for an icon", metrics)
+        if metrics["foreground_ratio"] < 0.01:
+            return CropQuality(False, "crop is mostly empty background", metrics)
+
+        if ocr_boxes:
+            text_area = sum(intersection_area(bbox, box.bbox) for box in ocr_boxes)
+            metrics["ocr_overlap_ratio"] = float(text_area / area)
+            if metrics["ocr_overlap_ratio"] > 0.10:
+                return CropQuality(False, "crop appears to include text", metrics)
+
+    return CropQuality(True, "ok", metrics)
+
+
 def relative_to_repo(path: Path) -> str:
     try:
         return str(path.relative_to(Path.cwd()))
@@ -296,60 +412,150 @@ def existing_asset_path(asset: dict) -> Path | None:
     return path if path.exists() else None
 
 
-def generation_prompt(query: dict) -> str:
-    prompt = query.get("generation_prompt")
-    if prompt:
-        return prompt
-    label = query.get("semantic_label") or query["name"].replace("_", " ")
-    return (
-        "Create a simple, text-free SaaS/security presentation pictogram. "
-        f"Subject: {label}. "
-        "Style: clean vector-like enterprise presentation icon, blue/green/red line art as appropriate, "
-        "minimal detail, centered, generous padding. "
-        "Background: perfectly flat solid #00ff00 chroma-key color for background removal. "
-        "No words, no letters, no logos, no watermark, no shadow, no gradient background."
+def style_direction(style: str) -> str:
+    if style == "white_line":
+        return "white line art only"
+    if style == "white_on_blue":
+        return "white pictogram centered on a solid blue circular badge"
+    if style == "status_check":
+        return "green check or approval pictogram with minimal blue supporting line art"
+    if style == "status_error":
+        return "red error or X pictogram with minimal blue supporting line art"
+    if style == "blue_fill":
+        return "blue filled pictogram with subtle lighter-blue detail"
+    return "blue line art with small blue filled accents"
+
+
+def make_chroma_key_transparent(path: Path) -> None:
+    """Remove generated icon chroma backgrounds without touching source crops."""
+    with Image.open(path).convert("RGBA") as image:
+        pixels = np.array(image)
+
+    rgb = pixels[..., :3].astype(np.int16)
+    remove = np.zeros(pixels.shape[:2], dtype=bool)
+    border_rgb = np.concatenate(
+        [
+            rgb[0, :, :],
+            rgb[-1, :, :],
+            rgb[:, 0, :],
+            rgb[:, -1, :],
+        ],
+        axis=0,
     )
+
+    for key_color in CHROMA_KEY_COLORS:
+        key = np.array(key_color, dtype=np.int16)
+        border_delta = np.max(np.abs(border_rgb - key), axis=1)
+        if float(np.mean(border_delta <= CHROMA_BORDER_DELTA)) < 0.20:
+            continue
+
+        delta = np.max(np.abs(rgb - key), axis=2)
+        key_mask = (delta <= CHROMA_REMOVE_DELTA).astype(np.uint8)
+        num_labels, labels = cv2.connectedComponents(key_mask)
+        if num_labels <= 1:
+            continue
+
+        edge_labels = np.unique(
+            np.concatenate(
+                [
+                    labels[0, :],
+                    labels[-1, :],
+                    labels[:, 0],
+                    labels[:, -1],
+                ]
+            )
+        )
+        edge_labels = edge_labels[edge_labels != 0]
+        if edge_labels.size:
+            remove |= np.isin(labels, edge_labels)
+
+    if remove.any():
+        pixels[remove, :3] = 0
+        pixels[remove, 3] = 0
+        Image.fromarray(pixels).save(path)
+    else:
+        make_background_transparent(path)
+
+
+def generation_prompt(query: dict) -> str:
+    icon_id, label = semantic_icon(query)
+    style = icon_style(query)
+    return (
+        "Create one reusable, text-free enterprise SaaS/security presentation icon. "
+        f"Canonical icon id: {icon_id}. Subject: {label}. "
+        f"Visual style: {style_direction(style)}. "
+        "Use a clean vector-like pictogram, centered composition, generous padding, and simple geometry. "
+        "No words, no letters, no numbers, no brand marks, no logos, no watermark, no UI text, no shadow. "
+        f"Use a perfectly flat {CHROMA_KEY_HEX} chroma-key background everywhere outside the icon artwork. "
+        "Do not use the chroma-key color inside the icon artwork."
+    )
+
+
+def generated_library_paths(icon_id: str, style: str) -> tuple[Path, Path, Path]:
+    library_dir = GENERATED_ICON_LIBRARY_DIR / style
+    library_stem = f"{safe_name(icon_id)}__{ICON_PROMPT_VERSION}"
+    return library_dir, library_dir / f"{library_stem}.png", library_dir / f"{library_stem}.json"
 
 
 def can_generate_asset(query: dict, mode: str) -> bool:
     if mode == "extract":
         return False
-    if not query.get("generatable", False):
+    if not bool_value(query.get("generatable", False)):
         return False
     if mode == "generate":
+        return True
+    icon_id, _ = semantic_icon(query)
+    style = icon_style(query)
+    _, library_path, _ = generated_library_paths(icon_id, style)
+    if library_path.exists():
         return True
     return bool(os.getenv("OPENAI_API_KEY"))
 
 
 def generate_asset(query: dict, out_dir: Path) -> dict | None:
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY is required for --asset-mode generate")
-    if not IMAGE_GEN_CLI.exists():
-        raise RuntimeError(f"Image generation CLI not found: {IMAGE_GEN_CLI}")
-
     raw_path = out_dir / f"{safe_name(query['name'])}_generated_raw.png"
     final_path = out_dir / f"{safe_name(query['name'])}.png"
     prompt = generation_prompt(query)
     model = query.get("generation_model", "gpt-image-2")
     size = query.get("generation_size", "1024x1024")
     quality = query.get("generation_quality", "medium")
+    icon_id, label = semantic_icon(query)
+    style = icon_style(query)
     cache_key = hashlib.sha256(
         json.dumps(
-            {"model": model, "size": size, "quality": quality, "prompt": prompt},
+            {
+                "model": model,
+                "size": size,
+                "quality": quality,
+                "icon_id": icon_id,
+                "style": style,
+                "prompt_version": ICON_PROMPT_VERSION,
+                "prompt": prompt,
+            },
             sort_keys=True,
         ).encode("utf-8")
     ).hexdigest()[:24]
-    cache_path = GENERATED_CACHE_DIR / f"{cache_key}.png"
-    if cache_path.exists():
-        shutil.copyfile(cache_path, final_path)
+    library_dir, library_path, manifest_path = generated_library_paths(icon_id, style)
+    if library_path.exists():
+        shutil.copyfile(library_path, final_path)
         return {
             "path": relative_to_repo(final_path),
             "bbox": None,
             "anchor_text": query.get("anchor_text"),
-            "source": "generated_cache",
+            "source": "generated_icon_library",
+            "icon_id": icon_id,
+            "icon_style": style,
+            "semantic_label": label,
             "generation_prompt": prompt,
+            "prompt_version": ICON_PROMPT_VERSION,
             "cache_key": cache_key,
+            "library_reused": True,
         }
+
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is required to generate a missing icon")
+    if not IMAGE_GEN_CLI.exists():
+        raise RuntimeError(f"Image generation CLI not found: {IMAGE_GEN_CLI}")
 
     cmd = [
         sys.executable,
@@ -369,16 +575,38 @@ def generate_asset(query: dict, out_dir: Path) -> dict | None:
     ]
     subprocess.run(cmd, check=True)
     raw_path.replace(final_path)
-    make_background_transparent(final_path)
-    GENERATED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(final_path, cache_path)
+    make_chroma_key_transparent(final_path)
+    library_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(final_path, library_path)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "icon_id": icon_id,
+                "icon_style": style,
+                "semantic_label": label,
+                "model": model,
+                "size": size,
+                "quality": quality,
+                "prompt_version": ICON_PROMPT_VERSION,
+                "cache_key": cache_key,
+                "generation_prompt": prompt,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
     return {
         "path": relative_to_repo(final_path),
         "bbox": None,
         "anchor_text": query.get("anchor_text"),
-        "source": "generated",
+        "source": "generated_icon_library",
+        "icon_id": icon_id,
+        "icon_style": style,
+        "semantic_label": label,
         "generation_prompt": prompt,
+        "prompt_version": ICON_PROMPT_VERSION,
         "cache_key": cache_key,
+        "library_reused": False,
     }
 
 
@@ -430,7 +658,8 @@ def main() -> None:
                 asset = generate_asset(query, out_dir)
                 assets[name] = asset
                 manifest["assets"][name] = asset
-                print(f"{name}: generated")
+                action = "reused generated icon" if asset.get("library_reused") else "generated"
+                print(f"{name}: {action}")
                 continue
             except Exception as exc:
                 if args.asset_mode == "generate":
@@ -438,23 +667,41 @@ def main() -> None:
                 print(f"warning: generation failed for {name}; falling back to Vision extraction: {exc}", file=sys.stderr)
 
         direct_bbox = query_bbox_crop(query, img)
+        icon_id, icon_label = semantic_icon(query)
+        style = icon_style(query)
         if direct_bbox is not None:
             x, y, w, h = direct_bbox
             crop = img[y:y + h, x:x + w]
-            path = out_dir / f"{safe_name(name)}.png"
-            cv2.imwrite(str(path), crop)
-            if query.get("transparent", True):
-                make_background_transparent(path)
+            if bool_value(query.get("generatable", False)) and ocr_boxes is None:
+                try:
+                    ocr_boxes = ocr_text(image_path)
+                except Exception as exc:  # noqa: BLE001 - quality text check is best effort
+                    print(f"warning: OCR unavailable for crop quality check: {exc}", file=sys.stderr)
+            quality = assess_crop_quality(direct_bbox, crop, query=query, img=img, ocr_boxes=ocr_boxes)
+            if not quality.ok:
+                print(f"warning: rejected bbox crop for {name}: {quality.reason}", file=sys.stderr)
+                if not query.get("anchor_text"):
+                    continue
+            else:
+                path = out_dir / f"{safe_name(name)}.png"
+                cv2.imwrite(str(path), crop)
+                if bool_value(query.get("transparent", True)):
+                    make_background_transparent(path)
 
-            asset = {
-                "path": relative_to_repo(path),
-                "bbox": [int(x), int(y), int(w), int(h)],
-                "source": "bbox_crop",
-            }
-            assets[name] = asset
-            manifest["assets"][name] = asset
-            print(f"{name}: bbox={asset['bbox']}")
-            continue
+                asset = {
+                    "path": relative_to_repo(path),
+                    "bbox": [int(x), int(y), int(w), int(h)],
+                    "source": "bbox_crop",
+                    "icon_id": icon_id,
+                    "icon_style": style,
+                    "semantic_label": icon_label,
+                    "crop_quality": quality.reason,
+                    "crop_metrics": quality.metrics,
+                }
+                assets[name] = asset
+                manifest["assets"][name] = asset
+                print(f"{name}: bbox={asset['bbox']}")
+                continue
 
         anchor_text = query.get("anchor_text")
         if not anchor_text:
@@ -474,18 +721,28 @@ def main() -> None:
 
         x, y, w, h = bbox
         crop = img[y:y + h, x:x + w]
+        quality = assess_crop_quality(bbox, crop, query=query, img=img, ocr_boxes=ocr_boxes)
+        if not quality.ok:
+            print(f"warning: rejected OCR crop for {name}: {quality.reason}", file=sys.stderr)
+            continue
         path = out_dir / f"{safe_name(name)}.png"
         cv2.imwrite(str(path), crop)
-        if query.get("transparent", True):
+        if bool_value(query.get("transparent", True)):
             make_background_transparent(path)
 
         asset = {
             "path": relative_to_repo(path),
             "bbox": [int(x), int(y), int(w), int(h)],
+            "source": "ocr_crop",
             "anchor_text": anchor_text,
             "ocr_text": match["ocr_text"],
             "ocr_score": round(match["score"], 3),
             "crop_rule": rule,
+            "icon_id": icon_id,
+            "icon_style": style,
+            "semantic_label": icon_label,
+            "crop_quality": quality.reason,
+            "crop_metrics": quality.metrics,
         }
         assets[name] = asset
         manifest["assets"][name] = asset

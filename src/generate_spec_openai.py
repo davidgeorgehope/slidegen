@@ -181,6 +181,14 @@ def clean_name(value: str) -> str:
     return "".join(chars).strip("_")
 
 
+def bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
 def normalize_bbox(value: Any, fallback: list[int]) -> list[int]:
     if not isinstance(value, list) or len(value) != 4:
         return fallback
@@ -238,15 +246,23 @@ def normalize_asset_queries(items: Any) -> list[dict[str, Any]]:
         seen.add(name)
         query = dict(item)
         query["name"] = name
+        icon_id = clean_name(str(query.get("icon_id") or query.get("canonical_icon") or name))
+        if icon_id.endswith("_icon"):
+            icon_id = icon_id[:-5]
+        if icon_id:
+            query["icon_id"] = icon_id
+        icon_style = str(query.get("icon_style") or query.get("style") or "blue_line").strip().lower().replace("-", "_")
+        if icon_style not in {"blue_line", "blue_fill", "white_line", "white_on_blue", "status_check", "status_error"}:
+            icon_style = "blue_line"
+        query["icon_style"] = icon_style
         if query.get("asset"):
             query["asset"] = clean_name(str(query["asset"]))
         if query.get("semantic_label"):
             query["semantic_label"] = str(query["semantic_label"]).strip()
         if query.get("anchor_text"):
             query["anchor_text"] = str(query["anchor_text"]).strip()
-        if query.get("generation_prompt"):
-            query["generation_prompt"] = str(query["generation_prompt"]).strip()
-        query["generatable"] = bool(query.get("generatable", False))
+        query.pop("generation_prompt", None)
+        query["generatable"] = bool_value(query.get("generatable", False))
         if query.get("crop_rule") not in {
             "nearest_icon_left",
             "nearest_icon_right",
