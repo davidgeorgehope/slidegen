@@ -11,7 +11,7 @@ from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Inches, Pt
 
-from render import (
+from pptx_utils import (
     DEFAULT_SOURCE_SIZE,
     SLIDE_H,
     SLIDE_W,
@@ -154,7 +154,7 @@ def render_left_panel(slide, spec, theme, fonts):
 
     y_positions = [458, 550, 646, 754]
     for idx, (step, cy) in enumerate(zip(lp["steps"], y_positions)):
-        circle_badge(slide, 76, cy, 58, theme, step["icon"])
+        circle_badge(slide, 76, cy, 58, theme, step.get("icon", "target"))
         if idx < len(y_positions) - 1:
             line(slide, 76, cy + 29, 76, y_positions[idx + 1] - 29, theme["accent_color"], 1.0, dashed=True)
         text_box(slide, [124, cy - 27, 280, 26], step["name"], size=13, color=theme["accent_color"], font=fonts["title"], bold=True)
@@ -166,7 +166,7 @@ def render_devices(slide, spec, theme, fonts):
     text_box(slide, [613, 129, 145, 24], "USERS & DEVICES", size=10, color=theme["accent_color"], font=fonts["body"], bold=True)
     xs = [842, 1037, 1225]
     for x, device in zip(xs, spec["devices"]):
-        device_icon(slide, x, 139, device["icon"], theme)
+        device_icon(slide, x, 139, device.get("icon", "device"), theme)
         text_box(slide, [x + 40, 121, 95, 42], device["label"], size=8, color=theme["body_color"], font=fonts["body"], bold=True)
         line(slide, x + 40, 174, x + 40, 202, theme["accent_color"], 1.0, dashed=True)
 
@@ -280,7 +280,7 @@ def render_parallel_layer(slide, spec, theme, fonts, base_dir):
     cap_xs = [880, 1070, 1265]
     for cx, cap in zip(cap_xs, item["capabilities"]):
         add_rect(slide, left=px_to_emu_x(cx), top=px_to_emu_y(728), width=px_to_emu_x(145), height=px_to_emu_y(60), fill_hex="EAF2FF", line_hex="BBD1FF", line_pt=1.0, radius=0.2)
-        circle_badge(slide, cx + 28, 758, 42, theme, "target" if cap["icon"] != "browser" else "globe")
+        circle_badge(slide, cx + 28, 758, 42, theme, "globe" if cap.get("icon") == "browser" else "target")
         text_box(slide, [cx + 58, 744, 75, 36], cap["title"], size=7, color=theme["accent_color"], font=fonts["body"], bold=True, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
     for tx in [905, 1035, 1185, 1335, 1522]:
         line(slide, tx, 681, tx, 650, theme["accent_color"], 1.0, dashed=True)

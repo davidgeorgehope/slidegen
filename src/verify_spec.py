@@ -35,11 +35,45 @@ def logo_refs(spec):
     return refs
 
 
+def generic_specs(spec):
+    if spec.get("layout") != "generic_deck":
+        return [spec]
+    shared_assets = spec.get("assets", {})
+    slides = []
+    for child in spec.get("slides", []):
+        if not isinstance(child, dict):
+            continue
+        merged = dict(child)
+        merged["assets"] = {**shared_assets, **child.get("assets", {})}
+        slides.append(merged)
+    return slides
+
+
+def generic_asset_refs(spec):
+    refs = []
+    for slide_spec in generic_specs(spec):
+        for element in slide_spec.get("elements", []):
+            if not isinstance(element, dict):
+                continue
+            if element.get("type") in {"image", "icon"} and element.get("asset"):
+                refs.append((element["asset"], slide_spec.get("slide", "slide"), element.get("type")))
+    return refs
+
+
 def verify(spec: dict) -> list[str]:
     warnings = []
     declared = {item.get("name") for item in spec.get("logo_assets", []) if isinstance(item, dict)}
+    declared_assets = {item.get("name") for item in spec.get("asset_queries", []) if isinstance(item, dict)}
     assets = spec.get("assets", {})
     seen_refs = {}
+
+    for name, slide_name, element_type in generic_asset_refs(spec):
+        if element_type == "icon":
+            continue
+        if name not in declared_assets and name not in declared:
+            warnings.append(f"{element_type} asset `{name}` is referenced by `{slide_name}` but not declared")
+        if name not in assets:
+            warnings.append(f"{element_type} asset `{name}` is referenced by `{slide_name}` but has no generated/extracted asset")
 
     for name, container_name, container_bbox in logo_refs(spec):
         seen_refs.setdefault(name, []).append(container_name)

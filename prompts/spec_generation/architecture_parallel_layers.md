@@ -72,10 +72,12 @@ Use this structure:
 
 Field guidance:
 - `bbox` arrays must be `[x, y, width, height]` in source image pixels.
-- `left_panel.steps[*].icon` must be one of `globe`, `lock`, `shield`, `target`.
-- `devices[*].icon` must be one of `laptop`, `phone`, `users`.
-- `parallel_layer.capabilities[*].icon` must be one of `connector`, `sync`, `browser`.
-- `layers[*].accent` must be one of `green`, `accent_color`, `purple`.
+- Icon fields are semantic hints, not strict enums. Prefer familiar values like
+  `globe`, `lock`, `shield`, `target`, `laptop`, `phone`, `users`, `connector`,
+  `sync`, or `browser` when they fit, but use a better free-form phrase when
+  the source slide calls for it.
+- `layers[*].accent` should be one of `green`, `accent_color`, `purple` when
+  possible; use another theme key or hex color only when visually necessary.
 - Logo `name` values must be lowercase snake_case.
 - Logo `match` values should be the visible OCR/vendor text to anchor the crop.
 - Put every real source logo referenced by `layers`, `saas_panel`, or the parallel layer into `logo_assets`.

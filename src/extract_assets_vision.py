@@ -29,10 +29,12 @@ assets for brand marks and source/library assets for vendor logos.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -57,6 +59,7 @@ MIN_COMPONENT_AREA = 8
 CLUSTER_GAP = 14
 CROP_PAD = 6
 IMAGE_GEN_CLI = Path.home() / ".codex/skills/.system/imagegen/scripts/image_gen.py"
+GENERATED_CACHE_DIR = Path("extracted") / "generated_cache"
 
 
 def normalize(text: str) -> str:
@@ -259,11 +262,38 @@ def crop_asset(img: np.ndarray, anchor_bbox: tuple[int, int, int, int], rule: st
     return expand_bbox(cluster, CROP_PAD, img)
 
 
+def query_bbox_crop(query: dict, img: np.ndarray):
+    bbox = query.get("bbox")
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return None
+    try:
+        x, y, w, h = [int(round(float(value))) for value in bbox]
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    x = max(0, min(x, img.shape[1] - 1))
+    y = max(0, min(y, img.shape[0] - 1))
+    w = max(1, min(w, img.shape[1] - x))
+    h = max(1, min(h, img.shape[0] - y))
+    return expand_bbox((x, y, w, h), int(query.get("pad", CROP_PAD)), img)
+
+
 def relative_to_repo(path: Path) -> str:
     try:
         return str(path.relative_to(Path.cwd()))
     except ValueError:
         return str(path)
+
+
+def existing_asset_path(asset: dict) -> Path | None:
+    path_value = asset.get("path") if isinstance(asset, dict) else None
+    if not path_value:
+        return None
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path if path.exists() else None
 
 
 def generation_prompt(query: dict) -> str:
@@ -300,18 +330,39 @@ def generate_asset(query: dict, out_dir: Path) -> dict | None:
     raw_path = out_dir / f"{safe_name(query['name'])}_generated_raw.png"
     final_path = out_dir / f"{safe_name(query['name'])}.png"
     prompt = generation_prompt(query)
+    model = query.get("generation_model", "gpt-image-2")
+    size = query.get("generation_size", "1024x1024")
+    quality = query.get("generation_quality", "medium")
+    cache_key = hashlib.sha256(
+        json.dumps(
+            {"model": model, "size": size, "quality": quality, "prompt": prompt},
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    cache_path = GENERATED_CACHE_DIR / f"{cache_key}.png"
+    if cache_path.exists():
+        shutil.copyfile(cache_path, final_path)
+        return {
+            "path": relative_to_repo(final_path),
+            "bbox": None,
+            "anchor_text": query.get("anchor_text"),
+            "source": "generated_cache",
+            "generation_prompt": prompt,
+            "cache_key": cache_key,
+        }
+
     cmd = [
         sys.executable,
         str(IMAGE_GEN_CLI),
         "generate",
         "--model",
-        query.get("generation_model", "gpt-image-2"),
+        model,
         "--prompt",
         prompt,
         "--size",
-        query.get("generation_size", "1024x1024"),
+        size,
         "--quality",
-        query.get("generation_quality", "medium"),
+        quality,
         "--out",
         str(raw_path),
         "--force",
@@ -319,12 +370,15 @@ def generate_asset(query: dict, out_dir: Path) -> dict | None:
     subprocess.run(cmd, check=True)
     raw_path.replace(final_path)
     make_background_transparent(final_path)
+    GENERATED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(final_path, cache_path)
     return {
         "path": relative_to_repo(final_path),
         "bbox": None,
         "anchor_text": query.get("anchor_text"),
         "source": "generated",
         "generation_prompt": prompt,
+        "cache_key": cache_key,
     }
 
 
@@ -361,10 +415,16 @@ def main() -> None:
         raise SystemExit(f"Could not read {image_path}")
     ocr_boxes = None
 
-    assets = {}
+    assets = dict(spec.get("assets", {})) if isinstance(spec.get("assets"), dict) else {}
     manifest = {"source_size": [int(img.shape[1]), int(img.shape[0])], "assets": {}}
     for query in queries:
         name = query["name"]
+        existing_path = existing_asset_path(assets.get(name, {}))
+        if existing_path is not None:
+            manifest["assets"][name] = assets[name]
+            print(f"{name}: reused {existing_path}")
+            continue
+
         if can_generate_asset(query, args.asset_mode):
             try:
                 asset = generate_asset(query, out_dir)
@@ -377,7 +437,29 @@ def main() -> None:
                     raise
                 print(f"warning: generation failed for {name}; falling back to Vision extraction: {exc}", file=sys.stderr)
 
-        anchor_text = query["anchor_text"]
+        direct_bbox = query_bbox_crop(query, img)
+        if direct_bbox is not None:
+            x, y, w, h = direct_bbox
+            crop = img[y:y + h, x:x + w]
+            path = out_dir / f"{safe_name(name)}.png"
+            cv2.imwrite(str(path), crop)
+            if query.get("transparent", True):
+                make_background_transparent(path)
+
+            asset = {
+                "path": relative_to_repo(path),
+                "bbox": [int(x), int(y), int(w), int(h)],
+                "source": "bbox_crop",
+            }
+            assets[name] = asset
+            manifest["assets"][name] = asset
+            print(f"{name}: bbox={asset['bbox']}")
+            continue
+
+        anchor_text = query.get("anchor_text")
+        if not anchor_text:
+            print(f"warning: no anchor_text or bbox for asset {name}", file=sys.stderr)
+            continue
         if ocr_boxes is None:
             ocr_boxes = ocr_text(image_path)
         rule = query.get("crop_rule", "nearest_icon_left")

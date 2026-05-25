@@ -43,6 +43,8 @@ def default_extract_dir(spec: dict, kind: str) -> Path:
 
 def renderer_for(spec: dict) -> list[str]:
     layout = spec.get("layout")
+    if layout in {"generic_slide", "generic_deck"}:
+        return [sys.executable, "src/render_generic.py"]
     if layout == "architecture_parallel_layers":
         return [sys.executable, "src/render_architecture.py"]
     raise ValueError(f"Unsupported layout: {layout}")
@@ -56,10 +58,15 @@ def main() -> None:
     parser.add_argument("--asset-mode", choices=["auto", "extract", "generate"], default="auto")
     parser.add_argument("--generate-spec", action="store_true", help="draft the JSON spec from the source image first")
     parser.add_argument("--force-spec", action="store_true", help="overwrite an existing generated spec")
-    parser.add_argument("--spec-layout", default="architecture_parallel_layers", help="layout to request from spec generation")
+    parser.add_argument("--spec-layout", default="generic_slide", help="layout to request from spec generation")
     parser.add_argument("--spec-model", default=None, help="OpenAI model for spec generation")
     parser.add_argument("--no-verify", action="store_true", help="skip non-fatal generated spec verification")
     parser.add_argument("--skip-assets", action="store_true")
+    parser.add_argument(
+        "--skip-generic-assets",
+        action="store_true",
+        help="extract real logo assets but leave generic icons to the native renderer fallback",
+    )
     args = parser.parse_args()
 
     image_path = Path(args.image)
@@ -99,7 +106,7 @@ def main() -> None:
 
         # Reload because logo extraction may have updated the spec.
         spec = json.loads(spec_path.read_text())
-        if spec.get("asset_queries"):
+        if spec.get("asset_queries") and not args.skip_generic_assets:
             run(
                 [
                     sys.executable,

@@ -47,7 +47,7 @@ DEFAULT_HEADER = {
 }
 
 
-SPEC_SCHEMA: dict[str, Any] = {
+ARCHITECTURE_SPEC_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": True,
     "required": [
@@ -85,6 +85,47 @@ SPEC_SCHEMA: dict[str, Any] = {
         "assets": {"type": "object"},
     },
 }
+
+
+GENERIC_SPEC_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": True,
+    "required": [
+        "slide",
+        "source_size",
+        "layout",
+        "logo_assets",
+        "asset_queries",
+        "assets",
+    ],
+    "properties": {
+        "slide": {"type": "string"},
+        "source_size": {
+            "type": "array",
+            "items": {"type": "integer"},
+            "minItems": 2,
+            "maxItems": 2,
+        },
+        "layout": {"type": "string", "enum": ["generic_slide", "generic_deck"]},
+        "theme": {"type": "object"},
+        "fonts": {"type": "object"},
+        "header": {"type": "object"},
+        "split_reason": {"type": "string"},
+        "slides": {"type": "array", "items": {"type": "object"}},
+        "elements": {"type": "array", "items": {"type": "object"}},
+        "logo_assets": {"type": "array", "items": {"type": "object"}},
+        "asset_queries": {"type": "array", "items": {"type": "object"}},
+        "assets": {"type": "object"},
+    },
+}
+
+
+def schema_for_layout(layout: str) -> dict[str, Any]:
+    if layout == "architecture_parallel_layers":
+        return ARCHITECTURE_SPEC_SCHEMA
+    if layout in {"generic_slide", "generic_deck"}:
+        return GENERIC_SPEC_SCHEMA
+    raise ValueError(f"Unsupported layout: {layout}")
 
 
 def load_env(path: Path) -> None:
@@ -152,29 +193,24 @@ def normalize_bbox(value: Any, fallback: list[int]) -> list[int]:
     return result
 
 
-def postprocess_spec(spec: dict[str, Any], image_path: Path, layout: str) -> dict[str, Any]:
-    with Image.open(image_path) as im:
-        source_size = [int(im.width), int(im.height)]
+def normalize_points(value: Any) -> list[int] | None:
+    if not isinstance(value, list) or len(value) != 4:
+        return None
+    result = []
+    for item in value:
+        try:
+            result.append(max(0, int(round(float(item)))))
+        except (TypeError, ValueError):
+            return None
+    return result
 
-    spec["slide"] = image_path.stem
-    spec["source_size"] = source_size
-    spec["layout"] = layout
-    model_header = spec.get("header", {}) if isinstance(spec.get("header"), dict) else {}
-    spec["theme"] = dict(DEFAULT_THEME)
-    spec["fonts"] = dict(DEFAULT_FONTS)
-    spec["header"] = dict(DEFAULT_HEADER)
-    if model_header.get("right_code") or model_header.get("date"):
-        spec["header"]["right_code"] = str(model_header.get("right_code") or model_header.get("date"))
-    if model_header.get("right_logo_placeholder") or model_header.get("placeholder"):
-        spec["header"]["right_logo_placeholder"] = str(
-            model_header.get("right_logo_placeholder") or model_header.get("placeholder")
-        )
-    spec.setdefault("asset_queries", [])
-    spec["assets"] = {}
 
+def normalize_logo_assets(items: Any) -> list[dict[str, str]]:
     logo_assets = []
     seen = set()
-    for item in spec.get("logo_assets", []):
+    if not isinstance(items, list):
+        return logo_assets
+    for item in items:
         if not isinstance(item, dict):
             continue
         match = str(item.get("match") or item.get("name") or "").strip()
@@ -185,7 +221,173 @@ def postprocess_spec(spec: dict[str, Any], image_path: Path, layout: str) -> dic
             continue
         seen.add(name)
         logo_assets.append({"name": name, "match": match})
-    spec["logo_assets"] = logo_assets
+    return logo_assets
+
+
+def normalize_asset_queries(items: Any) -> list[dict[str, Any]]:
+    queries = []
+    seen = set()
+    if not isinstance(items, list):
+        return queries
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = clean_name(str(item.get("name") or item.get("semantic_label") or item.get("anchor_text") or ""))
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        query = dict(item)
+        query["name"] = name
+        if query.get("asset"):
+            query["asset"] = clean_name(str(query["asset"]))
+        if query.get("semantic_label"):
+            query["semantic_label"] = str(query["semantic_label"]).strip()
+        if query.get("anchor_text"):
+            query["anchor_text"] = str(query["anchor_text"]).strip()
+        if query.get("generation_prompt"):
+            query["generation_prompt"] = str(query["generation_prompt"]).strip()
+        query["generatable"] = bool(query.get("generatable", False))
+        if query.get("crop_rule") not in {
+            "nearest_icon_left",
+            "nearest_icon_right",
+            "nearest_icon_above",
+            "nearest_icon_below",
+            "text_box",
+        }:
+            query["crop_rule"] = "nearest_icon_left"
+        if "bbox" in query:
+            query["bbox"] = normalize_bbox(query.get("bbox"), [0, 0, 1, 1])
+        queries.append(query)
+    return queries
+
+
+def normalize_generic_elements(items: Any, source_size: list[int]) -> list[dict[str, Any]]:
+    elements = []
+    if not isinstance(items, list):
+        return elements
+
+    full_box = [0, 0, source_size[0], source_size[1]]
+    allowed_types = {"text", "shape", "line", "image", "icon"}
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        element = dict(item)
+        element_type = str(element.get("type", "")).strip().lower()
+        if element_type not in allowed_types:
+            continue
+        element["type"] = element_type
+        element["z"] = int(element.get("z", idx)) if str(element.get("z", idx)).lstrip("-").isdigit() else idx
+
+        if element_type == "line":
+            points = normalize_points(element.get("points"))
+            if points is None:
+                continue
+            element["points"] = points
+            element["stroke_width"] = max(0.25, min(12.0, float(element.get("stroke_width", 1.0) or 1.0)))
+            element["arrow"] = bool(element.get("arrow", False))
+            element["dash"] = bool(element.get("dash", False))
+        else:
+            element["bbox"] = normalize_bbox(element.get("bbox"), full_box)
+
+        if element_type == "text":
+            element["text"] = str(element.get("text") or element.get("content") or element.get("label") or "")
+            if not element["text"].strip():
+                continue
+            if "font_size" in element:
+                try:
+                    element["font_size"] = max(5, min(72, int(round(float(element["font_size"])))))
+                except (TypeError, ValueError):
+                    element.pop("font_size", None)
+            element["bold"] = bool(element.get("bold", False))
+            element["italic"] = bool(element.get("italic", False))
+        elif element_type == "shape":
+            shape = str(element.get("shape") or "rect").strip().lower().replace("-", "_")
+            if shape in {"roundrect", "rounded_rect", "rounded_rectangle"}:
+                shape = "round_rect"
+            if shape not in {"rect", "round_rect", "ellipse"}:
+                shape = "rect"
+            element["shape"] = shape
+            if "stroke_width" in element:
+                try:
+                    element["stroke_width"] = max(0.0, min(12.0, float(element["stroke_width"])))
+                except (TypeError, ValueError):
+                    element["stroke_width"] = 0.75
+        elif element_type in {"image", "icon"}:
+            if element.get("asset"):
+                element["asset"] = clean_name(str(element["asset"]))
+            if element_type == "icon":
+                if element.get("name"):
+                    element["name"] = clean_name(str(element["name"]))
+                element["icon_hint"] = str(
+                    element.get("icon_hint") or element.get("name") or element.get("semantic_label") or "generic"
+                ).strip()
+
+        elements.append(element)
+
+    return sorted(elements, key=lambda element: element.get("z", 0))
+
+
+def postprocess_spec(spec: dict[str, Any], image_path: Path, layout: str) -> dict[str, Any]:
+    with Image.open(image_path) as im:
+        source_size = [int(im.width), int(im.height)]
+
+    spec["slide"] = image_path.stem
+    spec["source_size"] = source_size
+    requested_layout = layout
+    actual_layout = str(spec.get("layout") or requested_layout)
+    if requested_layout in {"generic_slide", "generic_deck"} and actual_layout == "generic_deck":
+        spec["layout"] = "generic_deck"
+    else:
+        spec["layout"] = requested_layout
+    model_header = spec.get("header", {}) if isinstance(spec.get("header"), dict) else {}
+    spec["theme"] = dict(DEFAULT_THEME)
+    spec["fonts"] = dict(DEFAULT_FONTS)
+    spec["header"] = dict(DEFAULT_HEADER)
+    if model_header.get("right_code") or model_header.get("date"):
+        spec["header"]["right_code"] = str(model_header.get("right_code") or model_header.get("date"))
+    if model_header.get("right_logo_placeholder") or model_header.get("placeholder"):
+        spec["header"]["right_logo_placeholder"] = str(
+            model_header.get("right_logo_placeholder") or model_header.get("placeholder")
+        )
+    spec["asset_queries"] = normalize_asset_queries(spec.get("asset_queries", []))
+    spec["assets"] = {}
+
+    spec["logo_assets"] = normalize_logo_assets(spec.get("logo_assets", []))
+
+    if spec["layout"] == "generic_deck":
+        raw_slides = spec.get("slides", [])
+        if not isinstance(raw_slides, list):
+            raw_slides = []
+        slides = []
+        raw_logo_assets: list[Any] = list(spec.get("logo_assets", []))
+        raw_asset_queries: list[Any] = list(spec.get("asset_queries", []))
+        for idx, child in enumerate(raw_slides, start=1):
+            if not isinstance(child, dict):
+                continue
+            slide_spec = dict(child)
+            slide_spec["slide"] = clean_name(str(slide_spec.get("slide") or f"{image_path.stem}_{idx:02d}"))
+            slide_spec["source_size"] = source_size
+            slide_spec["layout"] = "generic_slide"
+            slide_spec["theme"] = dict(spec["theme"])
+            slide_spec["fonts"] = dict(spec["fonts"])
+            slide_spec["header"] = dict(spec["header"])
+            slide_spec["elements"] = normalize_generic_elements(slide_spec.get("elements", []), source_size)
+            raw_logo_assets.extend(slide_spec.get("logo_assets", []))
+            raw_asset_queries.extend(slide_spec.get("asset_queries", []))
+            slide_spec["logo_assets"] = []
+            slide_spec["asset_queries"] = []
+            slide_spec["assets"] = {}
+            slides.append(slide_spec)
+        spec["slides"] = slides
+        spec["logo_assets"] = normalize_logo_assets(raw_logo_assets)
+        spec["asset_queries"] = normalize_asset_queries(raw_asset_queries)
+        validate_spec(spec)
+        return spec
+
+    if spec["layout"] == "generic_slide":
+        spec["elements"] = normalize_generic_elements(spec.get("elements", []), source_size)
+        validate_spec(spec)
+        return spec
 
     for layer in spec.get("layers", []):
         if not isinstance(layer, dict):
@@ -209,21 +411,55 @@ def postprocess_spec(spec: dict[str, Any], image_path: Path, layout: str) -> dic
 
 
 def validate_spec(spec: dict[str, Any]) -> None:
-    required = [
+    common_required = [
         "slide",
         "source_size",
         "layout",
         "theme",
         "fonts",
         "header",
+        "logo_assets",
+        "asset_queries",
+        "assets",
+    ]
+    missing = [key for key in common_required if key not in spec]
+    if missing:
+        raise ValueError(f"Generated spec missing required keys: {', '.join(missing)}")
+    if not isinstance(spec["logo_assets"], list):
+        raise ValueError("Generated logo_assets must be a list")
+    if not isinstance(spec["asset_queries"], list):
+        raise ValueError("Generated asset_queries must be a list")
+
+    if spec["layout"] == "generic_slide":
+        if not isinstance(spec.get("elements"), list) or not spec["elements"]:
+            raise ValueError("Generated generic spec has no elements")
+        for idx, element in enumerate(spec["elements"]):
+            if element.get("type") == "line":
+                if not element.get("points"):
+                    raise ValueError(f"Generated generic line element {idx} has no points")
+            elif not element.get("bbox"):
+                raise ValueError(f"Generated generic element {idx} has no bbox")
+        return
+
+    if spec["layout"] == "generic_deck":
+        if not isinstance(spec.get("slides"), list) or not spec["slides"]:
+            raise ValueError("Generated generic deck has no child slides")
+        for idx, child in enumerate(spec["slides"]):
+            if not isinstance(child, dict):
+                raise ValueError(f"Generated generic deck slide {idx} is not an object")
+            if child.get("layout") != "generic_slide":
+                raise ValueError(f"Generated generic deck slide {idx} is not a generic_slide")
+            if not isinstance(child.get("elements"), list) or not child["elements"]:
+                raise ValueError(f"Generated generic deck slide {idx} has no elements")
+        return
+
+    required = [
         "left_panel",
         "devices",
         "layers",
         "saas_panel",
         "parallel_layer",
         "callout",
-        "logo_assets",
-        "assets",
     ]
     missing = [key for key in required if key not in spec]
     if missing:
@@ -232,16 +468,15 @@ def validate_spec(spec: dict[str, Any]) -> None:
         raise ValueError(f"Unsupported generated layout: {spec['layout']}")
     if not spec["layers"]:
         raise ValueError("Generated architecture spec has no layers")
-    if not isinstance(spec["logo_assets"], list):
-        raise ValueError("Generated logo_assets must be a list")
 
 
 def generate_spec(image_path: Path, *, model: str, layout: str, include_ocr: bool) -> dict[str, Any]:
-    if layout != "architecture_parallel_layers":
-        raise ValueError(f"Only architecture_parallel_layers is implemented today, got {layout}")
-
     system_prompt = read_prompt("system.md")
-    layout_prompt = read_prompt("architecture_parallel_layers.md")
+    schema = schema_for_layout(layout)
+    if layout == "architecture_parallel_layers":
+        layout_prompt = read_prompt("architecture_parallel_layers.md")
+    else:
+        layout_prompt = read_prompt("generic_slide.md")
     ocr_context = vision_ocr_context(image_path) if include_ocr else "OCR omitted."
     user_prompt = (
         f"{layout_prompt}\n\n"
@@ -268,7 +503,7 @@ def generate_spec(image_path: Path, *, model: str, layout: str, include_ocr: boo
             "format": {
                 "type": "json_schema",
                 "name": "slide_spec",
-                "schema": SPEC_SCHEMA,
+                "schema": schema,
                 "strict": False,
             },
             "verbosity": "low",
@@ -282,7 +517,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("image")
     parser.add_argument("output_spec")
-    parser.add_argument("--layout", default="architecture_parallel_layers")
+    parser.add_argument("--layout", default="generic_slide")
     parser.add_argument("--model", default=None)
     parser.add_argument("--no-ocr", action="store_true")
     parser.add_argument("--force", action="store_true")
