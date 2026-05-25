@@ -205,6 +205,40 @@ def lint_spec(spec: dict[str, Any]) -> list[str]:
             paths = ", ".join(path for path, _element in items[:8])
             issues.append(f"{role} peer group has large font variance ({smallest:g}-{largest:g}, median {median:g}): {paths}")
 
+    shape_items = [
+        (path, element)
+        for path, element in iter_elements(spec)
+        if element.get("type") == "shape" and isinstance(element.get("bbox"), list)
+    ]
+    icon_items = [
+        (path, element)
+        for path, element in iter_elements(spec)
+        if element.get("type") == "icon" and isinstance(element.get("bbox"), list)
+    ]
+    for icon_path, icon in icon_items:
+        ix, iy, iw, ih = [float(value) for value in icon["bbox"]]
+        if iw <= 0 or ih <= 0:
+            continue
+        cx = ix + iw / 2
+        cy = iy + ih / 2
+        containers = []
+        for shape_path, shape in shape_items:
+            sx, sy, sw, sh = [float(value) for value in shape["bbox"]]
+            if sw <= iw * 1.25 or sh <= ih * 1.25:
+                continue
+            if sx <= cx <= sx + sw and sy <= cy <= sy + sh:
+                containers.append((shape_path, shape, sw * sh))
+        if not containers:
+            continue
+        shape_path, shape, _area = min(containers, key=lambda item: item[2])
+        sx, sy, sw, sh = [float(value) for value in shape["bbox"]]
+        ratio = min(iw / sw, ih / sh)
+        if ratio < 0.58 and min(sw, sh) >= 45:
+            issues.append(
+                f"{icon_path}: icon bbox is {ratio:.0%} of containing {shape.get('shape', 'shape')} "
+                f"{shape_path}; if the rendered source comparison looks undersized, resize around the same center"
+            )
+
     return issues[:30]
 
 

@@ -110,6 +110,8 @@ def main() -> None:
     parser.add_argument("--force-spec", action="store_true", help="overwrite an existing generated spec")
     parser.add_argument("--spec-layout", default="generic_slide", help="layout to request from spec generation")
     parser.add_argument("--spec-model", default=None, help="OpenAI model for spec generation")
+    parser.add_argument("--style-guide-image", action="append", default=[], help="optional brand/style guide image")
+    parser.add_argument("--template-pptx", default=None, help="optional template deck style reference")
     parser.add_argument("--refine", type=int, default=0, help="render/preview/critique refinement iterations")
     parser.add_argument("--refine-model", default=None, help="OpenAI model for refinement critique")
     parser.add_argument("--no-verify", action="store_true", help="skip non-fatal generated spec verification")
@@ -137,6 +139,10 @@ def main() -> None:
         ]
         if args.spec_model:
             cmd.extend(["--model", args.spec_model])
+        for helper in args.style_guide_image:
+            cmd.extend(["--style-guide-image", helper])
+        if args.template_pptx:
+            cmd.extend(["--template-pptx", args.template_pptx])
         if args.force_spec or not spec_path.exists():
             cmd.append("--force")
         run(cmd, env)

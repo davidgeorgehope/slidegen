@@ -9,6 +9,7 @@ Find only issues that materially reduce slide quality:
 - text boxes that are too small for the visible copy
 - repeated peer elements with inconsistent font sizes
 - repeated cards, chips, rows, or labels that are visibly misaligned
+- generic icon artwork that is too small or too large inside its badge/container
 - important content that drifted far from its source position
 
 Do not chase tiny pixel differences. Do not redesign the slide. Preserve the
@@ -23,7 +24,10 @@ Patch policy:
   issue.
 - Do not change slide text content unless it is a clear OCR/spec typo visible in
   the source image.
-- Do not modify real logos, generated icons, or raster images unless their
-  bounding boxes are clearly wrong.
+- Do not modify real logos or raster screenshots unless their bounding boxes are
+  clearly wrong.
+- You may resize generic icon bboxes when the rendered icon is visibly wrong
+  relative to the source badge/container. Keep the icon centered and consistent
+  with peer icons.
 
 Return only JSON. The caller will validate and reject unsafe operations.

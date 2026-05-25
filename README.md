@@ -171,6 +171,23 @@ OpenAI, then applies only validated JSON patch operations. The patch policy
 favors moving/resizing text boxes and grouped font scaling over one-off tiny
 font changes.
 
+Optional style helpers can be passed during spec generation:
+
+```bash
+.venv/bin/python src/run_pipeline.py \
+  images/source.png \
+  specs/source.auto.json \
+  output/source.pptx \
+  --generate-spec \
+  --force-spec \
+  --style-guide-image path/to/brand-style-guide.png \
+  --template-pptx path/to/template-deck.pptx
+```
+
+Helper images are reference-only. The source slide remains the authority for
+copy and meaning; style guides and template previews can influence palette,
+typography, spacing, card treatments, and icon treatment.
+
 To rerender an existing spec without rerunning OCR or OpenAI calls:
 
 ```bash

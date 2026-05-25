@@ -11,6 +11,7 @@ import json
 import mimetypes
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -487,7 +488,14 @@ def validate_spec(spec: dict[str, Any]) -> None:
         raise ValueError("Generated architecture spec has no layers")
 
 
-def generate_spec(image_path: Path, *, model: str, layout: str, include_ocr: bool) -> dict[str, Any]:
+def generate_spec(
+    image_path: Path,
+    *,
+    model: str,
+    layout: str,
+    include_ocr: bool,
+    helper_images: list[tuple[str, Path]] | None = None,
+) -> dict[str, Any]:
     system_prompt = read_prompt("system.md")
     schema = schema_for_layout(layout)
     if layout == "architecture_parallel_layers":
@@ -500,8 +508,25 @@ def generate_spec(image_path: Path, *, model: str, layout: str, include_ocr: boo
         f"Source image: {image_path.name}\n\n"
         "OCR boxes from the source image, in `[x,y,width,height]` pixels:\n"
         f"{ocr_context}\n\n"
+        "Optional helper/reference images, if provided, are style references only. "
+        "Use them for brand polish, palette, typography, spacing, card treatments, and icon treatment. "
+        "Do not copy their slide content unless that content is also visible in the source image. "
+        "The source image remains the authority for all slide copy and meaning.\n\n"
         "Now produce the JSON spec for this source slide."
     )
+
+    content: list[dict[str, Any]] = [
+        {"type": "input_text", "text": user_prompt},
+        {"type": "input_text", "text": "Source slide image to rebuild:"},
+        {"type": "input_image", "image_url": image_data_url(image_path), "detail": "high"},
+    ]
+    for label, helper_path in helper_images or []:
+        content.extend(
+            [
+                {"type": "input_text", "text": f"Optional helper/reference image: {label}"},
+                {"type": "input_image", "image_url": image_data_url(helper_path), "detail": "high"},
+            ]
+        )
 
     client = OpenAI()
     response = client.responses.create(
@@ -510,10 +535,7 @@ def generate_spec(image_path: Path, *, model: str, layout: str, include_ocr: boo
         input=[
             {
                 "role": "user",
-                "content": [
-                    {"type": "input_text", "text": user_prompt},
-                    {"type": "input_image", "image_url": image_data_url(image_path), "detail": "high"},
-                ],
+                "content": content,
             }
         ],
         text={
@@ -537,6 +559,8 @@ def main() -> None:
     parser.add_argument("--layout", default="generic_slide")
     parser.add_argument("--model", default=None)
     parser.add_argument("--no-ocr", action="store_true")
+    parser.add_argument("--style-guide-image", action="append", default=[], help="optional brand/style guide image")
+    parser.add_argument("--template-pptx", default=None, help="optional template deck to render as a style reference")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -546,9 +570,24 @@ def main() -> None:
     if out_path.exists() and not args.force:
         raise SystemExit(f"{out_path} exists; pass --force to overwrite")
 
+    helper_images = [(f"style guide: {Path(path).name}", Path(path)) for path in args.style_guide_image]
     model = args.model or os.environ.get("OPENAI_SPEC_MODEL") or os.environ.get("OPENAI_MODEL") or DEFAULT_SPEC_MODEL
-    spec = generate_spec(image_path, model=model, layout=args.layout, include_ocr=not args.no_ocr)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="slidegen_spec_helpers_") as tmp:
+        if args.template_pptx:
+            from render_preview import render_preview
+
+            template_path = Path(args.template_pptx)
+            template_preview = Path(tmp) / f"{template_path.stem}_preview.png"
+            render_preview(template_path, template_preview, size=1800)
+            helper_images.append((f"template deck preview: {template_path.name}", template_preview))
+        spec = generate_spec(
+            image_path,
+            model=model,
+            layout=args.layout,
+            include_ocr=not args.no_ocr,
+            helper_images=helper_images,
+        )
     out_path.write_text(json.dumps(spec, indent=2) + "\n")
     print(f"wrote {out_path} using {model}")
 

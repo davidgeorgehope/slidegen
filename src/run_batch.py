@@ -78,6 +78,10 @@ def pipeline_cmd(args, image_path: Path, spec_path: Path, out_path: Path) -> lis
     ]
     if args.spec_model:
         cmd.extend(["--spec-model", args.spec_model])
+    for helper in args.style_guide_image:
+        cmd.extend(["--style-guide-image", helper])
+    if args.template_pptx:
+        cmd.extend(["--template-pptx", args.template_pptx])
     if args.refine:
         cmd.extend(["--refine", str(args.refine)])
     if args.refine_model:
@@ -132,6 +136,8 @@ def main() -> None:
     parser.add_argument("--asset-mode", choices=["auto", "extract", "generate"], default="auto")
     parser.add_argument("--spec-layout", default="generic_slide")
     parser.add_argument("--spec-model", default=None)
+    parser.add_argument("--style-guide-image", action="append", default=[])
+    parser.add_argument("--template-pptx", default=None)
     parser.add_argument("--refine", type=int, default=0)
     parser.add_argument("--refine-model", default=None)
     parser.add_argument("--start", type=int, default=None)

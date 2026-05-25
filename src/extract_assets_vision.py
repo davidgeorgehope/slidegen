@@ -41,6 +41,7 @@ import sys
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -453,10 +454,62 @@ def generated_icon_artwork_metrics(path: Path, chroma_key: tuple[int, int, int])
     rgb = pixels[..., :3].astype(np.int16)
     delta = np.max(np.abs(rgb - np.array(chroma_key, dtype=np.int16)), axis=2)
     chroma_pixels = opaque & (delta <= CHROMA_ARTWORK_DELTA)
+    ys, xs = np.where(opaque)
+    alpha_width = int(xs.max() - xs.min() + 1) if xs.size else 0
+    alpha_height = int(ys.max() - ys.min() + 1) if ys.size else 0
     return {
         "opaque_ratio": float(opaque.mean()),
         "chroma_key_ratio": float(chroma_pixels.sum() / opaque_count),
+        "alpha_bbox_width_ratio": float(alpha_width / pixels.shape[1]) if pixels.shape[1] else 0.0,
+        "alpha_bbox_height_ratio": float(alpha_height / pixels.shape[0]) if pixels.shape[0] else 0.0,
     }
+
+
+def normalize_transparent_padding(path: Path, *, target_coverage: float = 0.90) -> dict[str, Any]:
+    """Scale transparent PNG artwork so alpha content fills the canvas consistently."""
+    with Image.open(path).convert("RGBA") as image:
+        bbox = image.getbbox()
+        if bbox is None:
+            return {"normalized": False, "reason": "empty_alpha"}
+        width, height = image.size
+        left, top, right, bottom = bbox
+        art_w = right - left
+        art_h = bottom - top
+        if art_w <= 0 or art_h <= 0:
+            return {"normalized": False, "reason": "empty_bbox"}
+
+        current_coverage = max(art_w / width, art_h / height)
+        if current_coverage >= target_coverage * 0.98:
+            return {
+                "normalized": False,
+                "alpha_bbox": [left, top, art_w, art_h],
+                "alpha_bbox_coverage": float(current_coverage),
+            }
+
+        scale = min((width * target_coverage) / art_w, (height * target_coverage) / art_h)
+        if scale <= 1.02:
+            return {
+                "normalized": False,
+                "alpha_bbox": [left, top, art_w, art_h],
+                "alpha_bbox_coverage": float(current_coverage),
+            }
+
+        crop = image.crop(bbox)
+        new_w = max(1, min(width, int(round(art_w * scale))))
+        new_h = max(1, min(height, int(round(art_h * scale))))
+        crop = crop.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        paste_x = (width - new_w) // 2
+        paste_y = (height - new_h) // 2
+        canvas.alpha_composite(crop, (paste_x, paste_y))
+        canvas.save(path)
+        return {
+            "normalized": True,
+            "alpha_bbox": [left, top, art_w, art_h],
+            "alpha_bbox_coverage": float(current_coverage),
+            "normalized_bbox": [paste_x, paste_y, new_w, new_h],
+            "normalized_coverage": float(max(new_w / width, new_h / height)),
+        }
 
 
 def crop_bytes(crop: np.ndarray) -> bytes:
@@ -635,6 +688,9 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
     library_dir, library_path, manifest_path = generated_library_paths(icon_id, reference.image_hash)
     if library_path.exists():
         shutil.copyfile(library_path, final_path)
+        padding_metrics = normalize_transparent_padding(final_path)
+        artwork_metrics = generated_icon_artwork_metrics(final_path, reference.chroma_key)
+        artwork_metrics["padding_normalization"] = padding_metrics
         return {
             "path": relative_to_repo(final_path),
             "bbox": None,
@@ -651,6 +707,7 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
             "source_reference_type": reference.source,
             "chroma_key": chroma_hex,
             "cache_key": cache_key,
+            "generation_metrics": artwork_metrics,
             "library_reused": True,
         }
 
@@ -680,7 +737,9 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
     subprocess.run(cmd, check=True)
     raw_path.replace(final_path)
     make_chroma_key_transparent(final_path, reference.chroma_key)
+    padding_metrics = normalize_transparent_padding(final_path)
     artwork_metrics = generated_icon_artwork_metrics(final_path, reference.chroma_key)
+    artwork_metrics["padding_normalization"] = padding_metrics
     library_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(final_path, library_path)
     manifest_path.write_text(
