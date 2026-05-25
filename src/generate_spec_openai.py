@@ -251,10 +251,11 @@ def normalize_asset_queries(items: Any) -> list[dict[str, Any]]:
             icon_id = icon_id[:-5]
         if icon_id:
             query["icon_id"] = icon_id
-        icon_style = str(query.get("icon_style") or query.get("style") or "blue_line").strip().lower().replace("-", "_")
-        if icon_style not in {"blue_line", "blue_fill", "white_line", "white_on_blue", "status_check", "status_error"}:
-            icon_style = "blue_line"
-        query["icon_style"] = icon_style
+        icon_style = str(query.get("icon_style") or query.get("style") or query.get("icon_treatment") or "").strip()
+        if icon_style:
+            query["icon_style"] = icon_style
+        else:
+            query.pop("icon_style", None)
         if query.get("asset"):
             query["asset"] = clean_name(str(query["asset"]))
         if query.get("semantic_label"):

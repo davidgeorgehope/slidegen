@@ -2,12 +2,13 @@
 
 For generic pictograms the preferred flow is:
 
-1. In `auto` mode, regenerate assets marked `generatable: true` when
-   OPENAI_API_KEY exists.
-2. If generation is unavailable or fails in `auto`, fall back to Vision/OpenCV
+1. Crop a source reference from the input image using `bbox` or an OCR anchor.
+2. In `auto` mode, use image generation as a cleanup/reconstruction pass from
+   that source crop when OPENAI_API_KEY exists.
+3. If generation is unavailable or fails in `auto`, fall back to Vision/OpenCV
    extraction.
-3. Use `extract` for deterministic source crops only, or `generate` to require
-   GPT image generation.
+4. Use `extract` for deterministic source crops only, or `generate` to require
+   GPT image generation from a source reference crop.
 
 Vision extraction is the scalable version of "crop the icon next to this
 label":
@@ -61,12 +62,12 @@ CLUSTER_GAP = 14
 CROP_PAD = 6
 IMAGE_GEN_CLI = Path.home() / ".codex/skills/.system/imagegen/scripts/image_gen.py"
 GENERATED_ICON_LIBRARY_DIR = Path("extracted") / "generated_icon_library"
-VALID_ICON_STYLES = {"blue_line", "blue_fill", "white_line", "white_on_blue", "status_check", "status_error"}
-ICON_PROMPT_VERSION = "v2"
-CHROMA_KEY_HEX = "#ff00ff"
-CHROMA_KEY_COLORS = ((255, 0, 255), (0, 255, 0))
+ICON_PROMPT_VERSION = "v4"
+CHROMA_KEY_CANDIDATES = ((255, 0, 255), (0, 255, 0), (255, 234, 0), (0, 255, 255))
 CHROMA_BORDER_DELTA = 80
 CHROMA_REMOVE_DELTA = 128
+CHROMA_ARTWORK_DELTA = 72
+DEFAULT_ICON_STYLE = "source-matched presentation pictogram"
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,15 @@ class CropQuality:
     ok: bool
     reason: str
     metrics: dict[str, float]
+
+
+@dataclass(frozen=True)
+class SourceReference:
+    path: Path
+    bbox: tuple[int, int, int, int]
+    source: str
+    image_hash: str
+    chroma_key: tuple[int, int, int]
 
 
 def normalize(text: str) -> str:
@@ -108,10 +118,8 @@ def semantic_icon(query: dict) -> tuple[str, str]:
 
 
 def icon_style(query: dict) -> str:
-    explicit = str(query.get("icon_style") or query.get("style") or "").strip().lower().replace("-", "_")
-    if explicit in VALID_ICON_STYLES:
-        return explicit
-    return "blue_line"
+    explicit = str(query.get("icon_style") or query.get("style") or query.get("icon_treatment") or "").strip()
+    return explicit or DEFAULT_ICON_STYLE
 
 
 def bool_value(value) -> bool:
@@ -412,21 +420,84 @@ def existing_asset_path(asset: dict) -> Path | None:
     return path if path.exists() else None
 
 
-def style_direction(style: str) -> str:
-    if style == "white_line":
-        return "white line art only"
-    if style == "white_on_blue":
-        return "white pictogram centered on a solid blue circular badge"
-    if style == "status_check":
-        return "green check or approval pictogram with minimal blue supporting line art"
-    if style == "status_error":
-        return "red error or X pictogram with minimal blue supporting line art"
-    if style == "blue_fill":
-        return "blue filled pictogram with subtle lighter-blue detail"
-    return "blue line art with small blue filled accents"
+def rgb_to_hex(color: tuple[int, int, int]) -> str:
+    return f"#{color[0]:02X}{color[1]:02X}{color[2]:02X}"
 
 
-def make_chroma_key_transparent(path: Path) -> None:
+def color_distance(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
+    return math.sqrt(sum((left - right) ** 2 for left, right in zip(a, b)))
+
+
+def choose_chroma_key_from_crop(crop: np.ndarray) -> tuple[int, int, int]:
+    if crop.size == 0:
+        return CHROMA_KEY_CANDIDATES[0]
+    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).reshape(-1, 3)
+    if len(rgb) > 12000:
+        step = max(1, len(rgb) // 12000)
+        rgb = rgb[::step]
+    source_colors = [tuple(int(channel) for channel in pixel) for pixel in rgb]
+    return max(
+        CHROMA_KEY_CANDIDATES,
+        key=lambda candidate: min(color_distance(candidate, color) for color in source_colors),
+    )
+
+
+def generated_icon_artwork_metrics(path: Path, chroma_key: tuple[int, int, int]) -> dict[str, float]:
+    with Image.open(path).convert("RGBA") as image:
+        pixels = np.array(image)
+    opaque = pixels[..., 3] > 0
+    opaque_count = int(opaque.sum())
+    if opaque_count == 0:
+        return {"opaque_ratio": 0.0, "chroma_key_ratio": 0.0}
+
+    rgb = pixels[..., :3].astype(np.int16)
+    delta = np.max(np.abs(rgb - np.array(chroma_key, dtype=np.int16)), axis=2)
+    chroma_pixels = opaque & (delta <= CHROMA_ARTWORK_DELTA)
+    return {
+        "opaque_ratio": float(opaque.mean()),
+        "chroma_key_ratio": float(chroma_pixels.sum() / opaque_count),
+    }
+
+
+def crop_bytes(crop: np.ndarray) -> bytes:
+    ok, encoded = cv2.imencode(".png", crop)
+    if not ok:
+        raise RuntimeError("Could not encode source reference crop")
+    return encoded.tobytes()
+
+
+def source_reference_for_query(query: dict, out_dir: Path, image_path: Path, img: np.ndarray) -> SourceReference | None:
+    bbox = query_bbox_crop(query, img)
+    source = "bbox_reference"
+
+    if bbox is None and query.get("anchor_text"):
+        ocr_boxes = ocr_text(image_path)
+        match = match_anchor(str(query["anchor_text"]), ocr_boxes, img, query.get("prefer"))
+        if match is not None:
+            rule = query.get("crop_rule", "nearest_icon_left")
+            bbox = crop_asset(img, match["bbox"], rule)
+            source = "ocr_reference"
+
+    if bbox is None:
+        return None
+
+    x, y, w, h = bbox
+    crop = img[y:y + h, x:x + w]
+    encoded = crop_bytes(crop)
+    reference_hash = hashlib.sha256(encoded).hexdigest()[:16]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    reference_path = out_dir / f"{safe_name(query['name'])}_source_reference.png"
+    reference_path.write_bytes(encoded)
+    return SourceReference(
+        path=reference_path,
+        bbox=bbox,
+        source=source,
+        image_hash=reference_hash,
+        chroma_key=choose_chroma_key_from_crop(crop),
+    )
+
+
+def make_chroma_key_transparent(path: Path, chroma_key: tuple[int, int, int]) -> None:
     """Remove generated icon chroma backgrounds without touching source crops."""
     with Image.open(path).convert("RGBA") as image:
         pixels = np.array(image)
@@ -443,31 +514,52 @@ def make_chroma_key_transparent(path: Path) -> None:
         axis=0,
     )
 
-    for key_color in CHROMA_KEY_COLORS:
-        key = np.array(key_color, dtype=np.int16)
-        border_delta = np.max(np.abs(border_rgb - key), axis=1)
-        if float(np.mean(border_delta <= CHROMA_BORDER_DELTA)) < 0.20:
-            continue
-
+    key = np.array(chroma_key, dtype=np.int16)
+    border_delta = np.max(np.abs(border_rgb - key), axis=1)
+    if float(np.mean(border_delta <= CHROMA_BORDER_DELTA)) >= 0.20:
         delta = np.max(np.abs(rgb - key), axis=2)
         key_mask = (delta <= CHROMA_REMOVE_DELTA).astype(np.uint8)
         num_labels, labels = cv2.connectedComponents(key_mask)
-        if num_labels <= 1:
-            continue
-
-        edge_labels = np.unique(
-            np.concatenate(
-                [
-                    labels[0, :],
-                    labels[-1, :],
-                    labels[:, 0],
-                    labels[:, -1],
-                ]
+        if num_labels > 1:
+            edge_labels = np.unique(
+                np.concatenate(
+                    [
+                        labels[0, :],
+                        labels[-1, :],
+                        labels[:, 0],
+                        labels[:, -1],
+                    ]
+                )
             )
-        )
-        edge_labels = edge_labels[edge_labels != 0]
-        if edge_labels.size:
-            remove |= np.isin(labels, edge_labels)
+            edge_labels = edge_labels[edge_labels != 0]
+            if edge_labels.size:
+                remove |= np.isin(labels, edge_labels)
+
+    if not remove.any():
+        for fallback in CHROMA_KEY_CANDIDATES:
+            key = np.array(fallback, dtype=np.int16)
+            border_delta = np.max(np.abs(border_rgb - key), axis=1)
+            if float(np.mean(border_delta <= CHROMA_BORDER_DELTA)) < 0.20:
+                continue
+            delta = np.max(np.abs(rgb - key), axis=2)
+            key_mask = (delta <= CHROMA_REMOVE_DELTA).astype(np.uint8)
+            num_labels, labels = cv2.connectedComponents(key_mask)
+            if num_labels <= 1:
+                continue
+            edge_labels = np.unique(
+                np.concatenate(
+                    [
+                        labels[0, :],
+                        labels[-1, :],
+                        labels[:, 0],
+                        labels[:, -1],
+                    ]
+                )
+            )
+            edge_labels = edge_labels[edge_labels != 0]
+            if edge_labels.size:
+                remove |= np.isin(labels, edge_labels)
+                break
 
     if remove.any():
         pixels[remove, :3] = 0
@@ -477,50 +569,54 @@ def make_chroma_key_transparent(path: Path) -> None:
         make_background_transparent(path)
 
 
-def generation_prompt(query: dict) -> str:
+def generation_prompt(query: dict, reference: SourceReference) -> str:
     icon_id, label = semantic_icon(query)
-    style = icon_style(query)
+    chroma_hex = rgb_to_hex(reference.chroma_key)
     return (
-        "Create one reusable, text-free enterprise SaaS/security presentation icon. "
+        "Recreate the pictogram/icon shown in the attached source crop as a clean reusable presentation asset. "
         f"Canonical icon id: {icon_id}. Subject: {label}. "
-        f"Visual style: {style_direction(style)}. "
-        "Use a clean vector-like pictogram, centered composition, generous padding, and simple geometry. "
-        "No words, no letters, no numbers, no brand marks, no logos, no watermark, no UI text, no shadow. "
-        f"Use a perfectly flat {CHROMA_KEY_HEX} chroma-key background everywhere outside the icon artwork. "
+        "The attached crop is the visual authority: preserve its colors, stroke weight, fill style, "
+        "badge/container shape, proportions, and visual density. "
+        "If the crop includes nearby labels, text, page background, crop edges, or noise, ignore those artifacts and keep only the icon artwork. "
+        "Do not invent a different palette, design system, badge color, or icon style. "
+        "No readable words, letters, numbers, brand marks, logos, watermark, UI text, or shadow. "
+        f"Use a perfectly flat {chroma_hex} chroma-key background everywhere outside the icon artwork. "
         "Do not use the chroma-key color inside the icon artwork."
     )
 
 
-def generated_library_paths(icon_id: str, style: str) -> tuple[Path, Path, Path]:
-    library_dir = GENERATED_ICON_LIBRARY_DIR / style
-    library_stem = f"{safe_name(icon_id)}__{ICON_PROMPT_VERSION}"
+def generated_library_paths(icon_id: str, reference_hash: str) -> tuple[Path, Path, Path]:
+    library_dir = GENERATED_ICON_LIBRARY_DIR / "source_reference" / safe_name(icon_id)
+    library_stem = f"{reference_hash}__{ICON_PROMPT_VERSION}"
     return library_dir, library_dir / f"{library_stem}.png", library_dir / f"{library_stem}.json"
 
 
-def can_generate_asset(query: dict, mode: str) -> bool:
+def can_generate_asset(query: dict, mode: str, reference: SourceReference | None) -> bool:
     if mode == "extract":
         return False
     if not bool_value(query.get("generatable", False)):
         return False
+    if reference is None:
+        return False
     if mode == "generate":
         return True
     icon_id, _ = semantic_icon(query)
-    style = icon_style(query)
-    _, library_path, _ = generated_library_paths(icon_id, style)
+    _, library_path, _ = generated_library_paths(icon_id, reference.image_hash)
     if library_path.exists():
         return True
     return bool(os.getenv("OPENAI_API_KEY"))
 
 
-def generate_asset(query: dict, out_dir: Path) -> dict | None:
+def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> dict | None:
     raw_path = out_dir / f"{safe_name(query['name'])}_generated_raw.png"
     final_path = out_dir / f"{safe_name(query['name'])}.png"
-    prompt = generation_prompt(query)
+    prompt = generation_prompt(query, reference)
     model = query.get("generation_model", "gpt-image-2")
     size = query.get("generation_size", "1024x1024")
     quality = query.get("generation_quality", "medium")
     icon_id, label = semantic_icon(query)
     style = icon_style(query)
+    chroma_hex = rgb_to_hex(reference.chroma_key)
     cache_key = hashlib.sha256(
         json.dumps(
             {
@@ -529,13 +625,14 @@ def generate_asset(query: dict, out_dir: Path) -> dict | None:
                 "quality": quality,
                 "icon_id": icon_id,
                 "style": style,
+                "reference_hash": reference.image_hash,
                 "prompt_version": ICON_PROMPT_VERSION,
                 "prompt": prompt,
             },
             sort_keys=True,
         ).encode("utf-8")
     ).hexdigest()[:24]
-    library_dir, library_path, manifest_path = generated_library_paths(icon_id, style)
+    library_dir, library_path, manifest_path = generated_library_paths(icon_id, reference.image_hash)
     if library_path.exists():
         shutil.copyfile(library_path, final_path)
         return {
@@ -548,6 +645,11 @@ def generate_asset(query: dict, out_dir: Path) -> dict | None:
             "semantic_label": label,
             "generation_prompt": prompt,
             "prompt_version": ICON_PROMPT_VERSION,
+            "source_reference": relative_to_repo(reference.path),
+            "source_reference_hash": reference.image_hash,
+            "source_reference_bbox": [int(value) for value in reference.bbox],
+            "source_reference_type": reference.source,
+            "chroma_key": chroma_hex,
             "cache_key": cache_key,
             "library_reused": True,
         }
@@ -560,9 +662,11 @@ def generate_asset(query: dict, out_dir: Path) -> dict | None:
     cmd = [
         sys.executable,
         str(IMAGE_GEN_CLI),
-        "generate",
+        "edit",
         "--model",
         model,
+        "--image",
+        str(reference.path),
         "--prompt",
         prompt,
         "--size",
@@ -575,7 +679,8 @@ def generate_asset(query: dict, out_dir: Path) -> dict | None:
     ]
     subprocess.run(cmd, check=True)
     raw_path.replace(final_path)
-    make_chroma_key_transparent(final_path)
+    make_chroma_key_transparent(final_path, reference.chroma_key)
+    artwork_metrics = generated_icon_artwork_metrics(final_path, reference.chroma_key)
     library_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(final_path, library_path)
     manifest_path.write_text(
@@ -588,6 +693,11 @@ def generate_asset(query: dict, out_dir: Path) -> dict | None:
                 "size": size,
                 "quality": quality,
                 "prompt_version": ICON_PROMPT_VERSION,
+                "source_reference_hash": reference.image_hash,
+                "source_reference_bbox": [int(value) for value in reference.bbox],
+                "source_reference_type": reference.source,
+                "chroma_key": chroma_hex,
+                "generation_metrics": artwork_metrics,
                 "cache_key": cache_key,
                 "generation_prompt": prompt,
             },
@@ -605,6 +715,12 @@ def generate_asset(query: dict, out_dir: Path) -> dict | None:
         "semantic_label": label,
         "generation_prompt": prompt,
         "prompt_version": ICON_PROMPT_VERSION,
+        "source_reference": relative_to_repo(reference.path),
+        "source_reference_hash": reference.image_hash,
+        "source_reference_bbox": [int(value) for value in reference.bbox],
+        "source_reference_type": reference.source,
+        "chroma_key": chroma_hex,
+        "generation_metrics": artwork_metrics,
         "cache_key": cache_key,
         "library_reused": False,
     }
@@ -653,9 +769,14 @@ def main() -> None:
             print(f"{name}: reused {existing_path}")
             continue
 
-        if can_generate_asset(query, args.asset_mode):
+        reference = None
+        if args.asset_mode != "extract" and bool_value(query.get("generatable", False)):
+            reference = source_reference_for_query(query, out_dir, image_path, img)
+            if args.asset_mode == "generate" and reference is None:
+                raise RuntimeError(f"source reference crop is required to generate asset {name}")
+        if can_generate_asset(query, args.asset_mode, reference):
             try:
-                asset = generate_asset(query, out_dir)
+                asset = generate_asset(query, out_dir, reference)
                 assets[name] = asset
                 manifest["assets"][name] = asset
                 action = "reused generated icon" if asset.get("library_reused") else "generated"

@@ -58,7 +58,7 @@ def discover_images(images_dir: Path, pattern: str, start: int | None, end: int 
 
 
 def run(cmd: list[str], env: dict[str, str], dry_run: bool) -> None:
-    print("+ " + " ".join(cmd))
+    print("+ " + " ".join(cmd), flush=True)
     if dry_run:
         return
     subprocess.run(cmd, cwd=ROOT, env=env, check=True)
@@ -78,6 +78,10 @@ def pipeline_cmd(args, image_path: Path, spec_path: Path, out_path: Path) -> lis
     ]
     if args.spec_model:
         cmd.extend(["--spec-model", args.spec_model])
+    if args.refine:
+        cmd.extend(["--refine", str(args.refine)])
+    if args.refine_model:
+        cmd.extend(["--refine-model", args.refine_model])
     if args.force_spec:
         cmd.extend(["--generate-spec", "--force-spec"])
     elif not spec_path.exists():
@@ -128,6 +132,8 @@ def main() -> None:
     parser.add_argument("--asset-mode", choices=["auto", "extract", "generate"], default="auto")
     parser.add_argument("--spec-layout", default="generic_slide")
     parser.add_argument("--spec-model", default=None)
+    parser.add_argument("--refine", type=int, default=0)
+    parser.add_argument("--refine-model", default=None)
     parser.add_argument("--start", type=int, default=None)
     parser.add_argument("--end", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None)
@@ -161,7 +167,7 @@ def main() -> None:
     for idx, image_path in enumerate(images, start=1):
         spec_path = spec_dir / f"{image_path.stem}.json"
         out_path = output_dir / f"{image_path.stem}.pptx"
-        print(f"\n[{idx}/{len(images)}] {image_path.name}")
+        print(f"\n[{idx}/{len(images)}] {image_path.name}", flush=True)
         run(pipeline_cmd(args, image_path, spec_path, out_path), env, args.dry_run)
         spec_paths.append(spec_path)
 

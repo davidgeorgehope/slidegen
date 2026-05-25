@@ -33,7 +33,7 @@ def load_env(path: Path) -> dict[str, str]:
 
 
 def run(cmd: list[str], env: dict[str, str]) -> None:
-    print("+ " + " ".join(cmd))
+    print("+ " + " ".join(cmd), flush=True)
     subprocess.run(cmd, cwd=ROOT, env=env, check=True)
 
 
@@ -50,6 +50,56 @@ def renderer_for(spec: dict) -> list[str]:
     raise ValueError(f"Unsupported layout: {layout}")
 
 
+def render(spec_path: Path, output_path: Path, env: dict[str, str]) -> None:
+    run(renderer_for(json.loads(spec_path.read_text())) + [str(spec_path), str(output_path)], env)
+
+
+def refine_output(
+    image_path: Path,
+    spec_path: Path,
+    output_path: Path,
+    *,
+    iterations: int,
+    model: str | None,
+    verify: bool,
+    env: dict[str, str],
+) -> None:
+    for iteration in range(1, iterations + 1):
+        previous_spec = spec_path.read_text()
+        preview_path = output_path.with_suffix(output_path.suffix + f".refine{iteration}.png")
+        refined_path = spec_path.with_suffix(spec_path.suffix + f".refine{iteration}")
+        run(
+            [
+                sys.executable,
+                "src/render_preview.py",
+                str(output_path),
+                str(preview_path),
+            ],
+            env,
+        )
+
+        cmd = [
+            sys.executable,
+            "src/refine_spec_openai.py",
+            str(image_path),
+            str(spec_path),
+            str(preview_path),
+            str(refined_path),
+        ]
+        if model:
+            cmd.extend(["--model", model])
+        run(cmd, env)
+
+        refined_spec = refined_path.read_text()
+        if refined_spec == previous_spec:
+            print("refinement produced no spec changes; stopping", flush=True)
+            break
+        spec_path.write_text(refined_spec)
+        if verify:
+            run([sys.executable, "src/verify_spec.py", str(spec_path)], env)
+        render(spec_path, output_path, env)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("image", help="source PNG")
@@ -60,6 +110,8 @@ def main() -> None:
     parser.add_argument("--force-spec", action="store_true", help="overwrite an existing generated spec")
     parser.add_argument("--spec-layout", default="generic_slide", help="layout to request from spec generation")
     parser.add_argument("--spec-model", default=None, help="OpenAI model for spec generation")
+    parser.add_argument("--refine", type=int, default=0, help="render/preview/critique refinement iterations")
+    parser.add_argument("--refine-model", default=None, help="OpenAI model for refinement critique")
     parser.add_argument("--no-verify", action="store_true", help="skip non-fatal generated spec verification")
     parser.add_argument("--skip-assets", action="store_true")
     parser.add_argument(
@@ -125,7 +177,17 @@ def main() -> None:
         run([sys.executable, "src/verify_spec.py", str(spec_path)], env)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    run(renderer_for(json.loads(spec_path.read_text())) + [str(spec_path), str(output_path)], env)
+    render(spec_path, output_path, env)
+    if args.refine > 0:
+        refine_output(
+            image_path,
+            spec_path,
+            output_path,
+            iterations=args.refine,
+            model=args.refine_model,
+            verify=not args.no_verify,
+            env=env,
+        )
 
 
 if __name__ == "__main__":

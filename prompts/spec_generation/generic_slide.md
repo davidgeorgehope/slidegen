@@ -67,7 +67,7 @@ For normal source images, emit one `generic_slide`:
     {
       "name": "secure_browser_icon",
       "icon_id": "secure_browser",
-      "icon_style": "blue_line",
+      "icon_style": "round source-colored line icon with a soft circular badge",
       "semantic_label": "secure browser session",
       "generatable": true,
       "anchor_text": "Browser session",
@@ -134,21 +134,22 @@ Field guidance:
   `browser isolation`, `user group`, `policy engine`, `risk signal`,
   `SaaS connector`, `ticket workflow`, `audit evidence`, `device posture`.
 - For generic non-brand icons, add an `asset_queries` item with
-  `generatable: true`. Include a stable `icon_id` and `icon_style`; the model
-  should do the semantic normalization, not the renderer. Reuse the same
-  `icon_id` for the same concept across slides, for example `api_key`,
-  `oauth_client`, `service_account`, `user_group`, `shield_check`,
-  `document_search`, or `target_crosshair`.
-- `icon_style` must be one of `blue_line`, `blue_fill`, `white_line`,
-  `white_on_blue`, `status_check`, or `status_error`. Use `blue_line` for most
-  icons, `white_line`/`white_on_blue` for dark or blue containers, and status
-  styles only for check/error markers.
+  `generatable: true`. Include a stable `icon_id`; the model should do semantic
+  normalization, not the renderer. Reuse the same `icon_id` for the same
+  concept across slides, for example `api_key`, `oauth_client`,
+  `service_account`, `user_group`, `shield_check`, `document_search`, or
+  `target_crosshair`.
+- `icon_style` is optional free-form visual observation from the source image,
+  not an enum. Use it only to describe what is visibly present, for example
+  `round purple badge with blue key line art`, `thin navy outline icon without
+  fill`, or `white pictogram inside a dark square`.
 - Image generation is the primary path for generic icons when `OPENAI_API_KEY`
-  exists; the `anchor_text`, `crop_rule`, and `bbox` fields give a
-  Vision/source-crop fallback.
+  exists; the asset pipeline first crops the source icon reference from `bbox`
+  or `anchor_text`, then uses that source crop as the imagegen reference.
+  Vision/source-crop output remains the fallback.
 - Do not emit per-icon `generation_prompt` text. The asset pipeline builds a
-  standardized prompt from `icon_id`, `icon_style`, and `semantic_label` so the
-  icon library remains consistent.
+  standardized prompt from the source reference crop, `icon_id`, optional
+  `icon_style`, and `semantic_label` so the icon follows the source image.
 - Do not generate real vendor, customer, product, or brand logos. Put those in
   `logo_assets` with visible OCR text in `match`.
 - Use `type: "image"` only for non-editable source visual material that should

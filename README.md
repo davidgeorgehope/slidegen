@@ -10,6 +10,8 @@ The project is intentionally spec-driven:
 4. Extract real source logos/assets from OCR anchors.
 5. Generate or reuse canonical generic, text-free pictograms when allowed.
 6. Render editable `.pptx` files with native text, shapes, connectors, and images.
+7. Optionally run render-preview-refine loops that critique the PPTX screenshot
+   and patch layout issues.
 
 The source image is treated as evidence, not as the slide background.
 
@@ -70,12 +72,16 @@ More layouts can be added by creating a prompt file and renderer pair.
 ```text
 slidegen/
 ├── prompts/
-│   └── spec_generation/
-│       ├── system.md
-│       ├── generic_slide.md
-│       └── architecture_parallel_layers.md
+│   ├── spec_generation/
+│   │   ├── system.md
+│   │   ├── generic_slide.md
+│   │   └── architecture_parallel_layers.md
+│   └── refinement/
+│       └── visual_quality.md
 ├── src/
 │   ├── generate_spec_openai.py
+│   ├── refine_spec_openai.py
+│   ├── render_preview.py
 │   ├── run_batch.py
 │   ├── run_pipeline.py
 │   ├── extract_assets_vision.py
@@ -100,6 +106,7 @@ For OpenAI-backed spec generation, create a local `.env` file:
 
 ```bash
 OPENAI_SPEC_MODEL=gpt-5.5
+OPENAI_REFINE_MODEL=gpt-5.5
 ```
 
 Set `OPENAI_API_KEY` in that local `.env` file. `.env` is ignored by git.
@@ -145,6 +152,25 @@ This will:
 The default `--spec-layout` is `generic_slide`. The model may emit a
 `generic_deck` when the source image is too dense for one readable slide.
 
+For visual QA, add one or more refinement iterations:
+
+```bash
+.venv/bin/python src/run_pipeline.py \
+  images/source.png \
+  specs/source.auto.json \
+  output/source.pptx \
+  --generate-spec \
+  --force-spec \
+  --asset-mode generate \
+  --refine 2
+```
+
+Each refinement iteration renders the PPTX, creates a Quick Look preview PNG,
+sends the source image, rendered preview, spec, and deterministic lint hints to
+OpenAI, then applies only validated JSON patch operations. The patch policy
+favors moving/resizing text boxes and grouped font scaling over one-off tiny
+font changes.
+
 To rerender an existing spec without rerunning OCR or OpenAI calls:
 
 ```bash
@@ -166,7 +192,8 @@ deck:
   --spec-dir specs/auto \
   --output-dir output/auto \
   --combined output/all_slides_auto.pptx \
-  --force-spec
+  --force-spec \
+  --refine 1
 ```
 
 For a fast layout-QA pass without generated/cropped generic icons, add
@@ -187,6 +214,7 @@ Prompts are versioned repo artifacts:
 - `prompts/spec_generation/system.md`
 - `prompts/spec_generation/generic_slide.md`
 - `prompts/spec_generation/architecture_parallel_layers.md`
+- `prompts/refinement/visual_quality.md`
 
 The prompt contract is deliberately strict:
 
@@ -195,6 +223,8 @@ The prompt contract is deliberately strict:
 - do not recreate real logos with image generation
 - do not generate slide text as raster art
 - emit a JSON spec that deterministic renderers can consume
+- refine rendered PPTX previews with constrained JSON patches, not full
+  free-form rewrites
 
 ## Asset Policy
 
@@ -202,10 +232,11 @@ Use this order:
 
 1. Template/master assets for brand marks and recurring design assets.
 2. Source crops or a logo library for real vendor/customer logos.
-3. A generated icon library for generic, non-brand, text-free pictograms. The
-   spec LLM emits stable `icon_id` and `icon_style` fields; the asset pipeline
-   generates each concept/style once and reuses it across slides. Existing
-   library icons can be reused without an API key.
+3. A source-reference generated icon library for generic, non-brand,
+   text-free pictograms. The asset pipeline first crops the source icon from
+   the image, then imagegen cleans/recreates that exact visual treatment.
+   Cached generated icons are keyed by the source reference crop, not by a
+   global style enum.
 4. Vision/OpenCV source crops as fallback for generic pictograms when generation
    is unavailable, disabled, or fails. Crop quality checks reject obviously bad
    icon crops.
@@ -214,9 +245,10 @@ Use this order:
 Image generation is not used to create full slides, charts, tables, real logos, or editable labels.
 The asset code does not infer icon meaning from regexes or alias tables. The
 spec LLM owns semantic normalization by emitting `icon_id`; if that field is
-missing, the asset pipeline only falls back to the asset name. The generic icon
-generation prompt is centralized in `src/extract_assets_vision.py` so repeated
-concepts stay visually consistent across slides.
+missing, the asset pipeline only falls back to the asset name. `icon_style` is
+free-form source-observed treatment text, not an enum. The generic icon prompt
+is centralized in `src/extract_assets_vision.py`, but the source crop is the
+visual authority.
 
 ## Security Notes
 
