@@ -37,8 +37,9 @@ def run(cmd: list[str], env: dict[str, str]) -> None:
     subprocess.run(cmd, cwd=ROOT, env=env, check=True)
 
 
-def default_extract_dir(spec: dict, kind: str) -> Path:
-    return ROOT / "extracted" / spec["slide"] / kind
+def default_extract_dir(spec: dict, kind: str, extract_root: Path | None = None) -> Path:
+    root = extract_root if extract_root is not None else ROOT / "extracted"
+    return root / spec["slide"] / kind
 
 
 def renderer_for(spec: dict) -> list[str]:
@@ -112,14 +113,21 @@ def main() -> None:
     parser.add_argument("--spec-model", default=None, help="OpenAI model for spec generation")
     parser.add_argument("--style-guide-image", action="append", default=[], help="optional brand/style guide image")
     parser.add_argument("--template-pptx", default=None, help="optional template deck style reference")
-    parser.add_argument("--refine", type=int, default=0, help="render/preview/critique refinement iterations")
+    parser.add_argument(
+        "--refine",
+        type=int,
+        default=2,
+        help="render/preview/critique refinement iterations; use 0 for fast layout-only runs",
+    )
     parser.add_argument("--refine-model", default=None, help="OpenAI model for refinement critique")
     parser.add_argument("--no-verify", action="store_true", help="skip non-fatal generated spec verification")
     parser.add_argument("--skip-assets", action="store_true")
+    parser.add_argument("--extract-root", default=None, help="scratch root for extracted logos and generated assets")
+    parser.add_argument("--icon-library-dir", default=None, help="scratch/cache directory for generated icon library")
     parser.add_argument(
         "--skip-generic-assets",
         action="store_true",
-        help="extract real logo assets but leave generic icons to the native renderer fallback",
+        help="layout-QA only: extract real logos but draw generic icons as native placeholders",
     )
     args = parser.parse_args()
 
@@ -127,6 +135,11 @@ def main() -> None:
     spec_path = Path(args.spec)
     output_path = Path(args.output)
     env = load_env(ROOT / ".env")
+    extract_root = Path(args.extract_root) if args.extract_root else None
+    if args.icon_library_dir:
+        env["SLIDEGEN_ICON_LIBRARY_DIR"] = str(Path(args.icon_library_dir))
+    if args.skip_generic_assets:
+        env["SLIDEGEN_ALLOW_NATIVE_ICON_PLACEHOLDERS"] = "1"
 
     if args.generate_spec or not spec_path.exists():
         cmd = [
@@ -156,7 +169,7 @@ def main() -> None:
                     "src/extract_logos_by_text.py",
                     str(image_path),
                     str(spec_path),
-                    str(default_extract_dir(spec, "logos")),
+                    str(default_extract_dir(spec, "logos", extract_root)),
                     "--update-spec",
                 ],
                 env,
@@ -171,7 +184,7 @@ def main() -> None:
                     "src/extract_assets_vision.py",
                     str(image_path),
                     str(spec_path),
-                    str(default_extract_dir(spec, "assets")),
+                    str(default_extract_dir(spec, "assets", extract_root)),
                     "--asset-mode",
                     args.asset_mode,
                     "--update-spec",

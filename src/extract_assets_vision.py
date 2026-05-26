@@ -3,15 +3,15 @@
 For generic pictograms the preferred flow is:
 
 1. Crop a source reference from the input image using `bbox` or an OCR anchor.
-2. In `auto` mode, use image generation as a cleanup/reconstruction pass from
-   that source crop when OPENAI_API_KEY exists.
-3. If generation is unavailable or fails in `auto`, fall back to Vision/OpenCV
-   extraction.
-4. Use `extract` for deterministic source crops only, or `generate` to require
-   GPT image generation from a source reference crop.
+2. Use image generation as a cleanup/reconstruction pass from that source crop.
+3. Reuse the generated icon library when the same source-reference crop has
+   already been generated.
+4. Fail loudly if a generic pictogram cannot be generated. Source crops are not
+   acceptable final output for generic icons.
 
-Vision extraction is the scalable version of "crop the icon next to this
-label":
+Vision extraction is still used to crop source references for generation and to
+crop non-generic raster assets. It is not used as final output for generic
+pictograms.
 
     {
       "name": "overview_handshake",
@@ -62,12 +62,15 @@ MIN_COMPONENT_AREA = 8
 CLUSTER_GAP = 14
 CROP_PAD = 6
 IMAGE_GEN_CLI = Path.home() / ".codex/skills/.system/imagegen/scripts/image_gen.py"
-GENERATED_ICON_LIBRARY_DIR = Path("extracted") / "generated_icon_library"
-ICON_PROMPT_VERSION = "v4"
+GENERATED_ICON_LIBRARY_DIR = Path(os.getenv("SLIDEGEN_ICON_LIBRARY_DIR", "extracted/generated_icon_library"))
+DEFAULT_ICON_PROMPT_VERSION = "v7"
+CONTAINER_ICON_PROMPT_VERSION = "v7"
 CHROMA_KEY_CANDIDATES = ((255, 0, 255), (0, 255, 0), (255, 234, 0), (0, 255, 255))
 CHROMA_BORDER_DELTA = 80
 CHROMA_REMOVE_DELTA = 128
 CHROMA_ARTWORK_DELTA = 72
+ICON_GENERATION_ATTEMPTS = 2
+ICON_SOURCE_MATTE_ATTEMPTS = 1
 DEFAULT_ICON_STYLE = "source-matched presentation pictogram"
 
 
@@ -85,6 +88,7 @@ class SourceReference:
     source: str
     image_hash: str
     chroma_key: tuple[int, int, int]
+    palette: dict[str, float]
 
 
 def normalize(text: str) -> str:
@@ -108,7 +112,7 @@ def slug(value: str) -> str:
 def semantic_icon(query: dict) -> tuple[str, str]:
     """Return the LLM-provided canonical icon id and human label.
 
-    The spec generator is responsible for semantic normalization. This fallback
+    The spec generator is responsible for semantic normalization. This default
     is deliberately dumb so we do not grow a hidden rules engine here.
     """
     icon_id = slug(str(query.get("icon_id") or query.get("canonical_icon") or query.get("name") or "generic_icon"))
@@ -429,6 +433,119 @@ def color_distance(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
     return math.sqrt(sum((left - right) ** 2 for left, right in zip(a, b)))
 
 
+def color_family_ratios_from_rgb(rgb: np.ndarray, alpha: np.ndarray | None = None) -> dict[str, float]:
+    if rgb.size == 0:
+        return {}
+    rgb = rgb.reshape(-1, 3).astype(np.uint8)
+    if alpha is not None:
+        alpha_mask = alpha.reshape(-1) > 0
+        rgb = rgb[alpha_mask]
+    if rgb.size == 0:
+        return {}
+
+    hsv = cv2.cvtColor(rgb.reshape(-1, 1, 3), cv2.COLOR_RGB2HSV).reshape(-1, 3)
+    hue = hsv[:, 0]
+    sat = hsv[:, 1]
+    val = hsv[:, 2]
+    colored = (sat > 50) & (val > 70)
+    colored_count = max(1, int(colored.sum()))
+    total_count = max(1, len(rgb))
+
+    families = {
+        "red": colored & ((hue <= 10) | (hue >= 170)),
+        "orange": colored & (hue > 10) & (hue <= 24),
+        "yellow": colored & (hue > 24) & (hue <= 38),
+        "green": colored & (hue > 38) & (hue <= 86),
+        "cyan": colored & (hue > 86) & (hue <= 102),
+        "blue": colored & (hue > 102) & (hue <= 132),
+        "purple": colored & (hue > 132) & (hue < 170),
+    }
+    ratios = {"colored_total": float(colored.sum() / total_count)}
+    for name, mask in families.items():
+        ratios[name] = float(mask.sum() / colored_count)
+        ratios[f"{name}_total"] = float(mask.sum() / total_count)
+    return ratios
+
+
+def color_family_ratios_from_bgr(crop: np.ndarray) -> dict[str, float]:
+    if crop.size == 0:
+        return {}
+    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    return color_family_ratios_from_rgb(rgb)
+
+
+def color_family_for_rgb(color: tuple[int, int, int]) -> str | None:
+    rgb = np.array(color, dtype=np.uint8).reshape(1, 1, 3)
+    hue, sat, val = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).reshape(3)
+    if sat <= 50 or val <= 70:
+        return None
+    if hue <= 10 or hue >= 170:
+        return "red"
+    if hue <= 24:
+        return "orange"
+    if hue <= 38:
+        return "yellow"
+    if hue <= 86:
+        return "green"
+    if hue <= 102:
+        return "cyan"
+    if hue <= 132:
+        return "blue"
+    return "purple"
+
+
+def observed_color_families(palette: dict[str, float], *, threshold: float = 0.04) -> list[str]:
+    names = []
+    for name in ("red", "orange", "yellow", "green", "cyan", "blue", "purple"):
+        if palette.get(name, 0.0) >= threshold and palette.get(f"{name}_total", 0.0) >= 0.003:
+            names.append(name)
+    return names
+
+
+def palette_prompt_text(palette: dict[str, float]) -> str:
+    observed = observed_color_families(palette)
+    if not observed:
+        return (
+            "Observed source foreground colors are mostly neutral/white; except for the flat chroma-key "
+            "background outside the icon, do not introduce new accent colors. "
+        )
+    blocked = [
+        name
+        for name in ("red", "orange", "yellow", "green", "cyan", "blue", "purple")
+        if name not in observed
+    ]
+    text = f"Observed source foreground color families: {', '.join(observed)}. "
+    if blocked:
+        text += (
+            "Except for the flat chroma-key background outside the icon, "
+            f"do not introduce absent accent colors such as {', '.join(blocked)}. "
+        )
+    return text
+
+
+def generated_palette(path: Path) -> dict[str, float]:
+    with Image.open(path).convert("RGBA") as image:
+        pixels = np.array(image)
+    return color_family_ratios_from_rgb(pixels[..., :3], pixels[..., 3])
+
+
+def validate_generated_palette(path: Path, reference: SourceReference) -> dict[str, Any]:
+    source = reference.palette
+    generated = generated_palette(path)
+    violations = []
+    for name in ("red", "orange", "yellow", "green", "cyan", "blue", "purple"):
+        source_has = source.get(name, 0.0) >= 0.04 and source.get(f"{name}_total", 0.0) >= 0.003
+        generated_has = generated.get(name, 0.0) >= 0.10 and generated.get(f"{name}_total", 0.0) >= 0.015
+        if generated_has and not source_has:
+            violations.append(name)
+    return {
+        "source_palette": source,
+        "generated_palette": generated,
+        "violations": violations,
+        "ok": not violations,
+    }
+
+
 def choose_chroma_key_from_crop(crop: np.ndarray) -> tuple[int, int, int]:
     if crop.size == 0:
         return CHROMA_KEY_CANDIDATES[0]
@@ -437,10 +554,17 @@ def choose_chroma_key_from_crop(crop: np.ndarray) -> tuple[int, int, int]:
         step = max(1, len(rgb) // 12000)
         rgb = rgb[::step]
     source_colors = [tuple(int(channel) for channel in pixel) for pixel in rgb]
-    return max(
-        CHROMA_KEY_CANDIDATES,
-        key=lambda candidate: min(color_distance(candidate, color) for color in source_colors),
-    )
+    palette = color_family_ratios_from_bgr(crop)
+    observed = set(observed_color_families(palette, threshold=0.02))
+
+    def score(candidate: tuple[int, int, int]) -> tuple[int, int, float]:
+        family = color_family_for_rgb(candidate)
+        family_present = int(family in observed)
+        green_family = int(family == "green")
+        distance = min(color_distance(candidate, color) for color in source_colors)
+        return (-family_present, -green_family, distance)
+
+    return max(CHROMA_KEY_CANDIDATES, key=score)
 
 
 def generated_icon_artwork_metrics(path: Path, chroma_key: tuple[int, int, int]) -> dict[str, float]:
@@ -547,7 +671,69 @@ def source_reference_for_query(query: dict, out_dir: Path, image_path: Path, img
         source=source,
         image_hash=reference_hash,
         chroma_key=choose_chroma_key_from_crop(crop),
+        palette=color_family_ratios_from_bgr(crop),
     )
+
+
+def iter_spec_elements(spec: dict) -> list[dict]:
+    if spec.get("layout") == "generic_deck":
+        elements: list[dict] = []
+        for child in spec.get("slides", []):
+            if isinstance(child, dict):
+                elements.extend(element for element in child.get("elements", []) if isinstance(element, dict))
+        return elements
+    return [element for element in spec.get("elements", []) if isinstance(element, dict)]
+
+
+def annotate_queries_with_render_context(spec: dict, queries: list[dict]) -> list[dict]:
+    """Tell image generation when the renderer already owns an icon container."""
+    elements = iter_spec_elements(spec)
+    shapes = [
+        element
+        for element in elements
+        if element.get("type") == "shape"
+        and element.get("shape") in {"ellipse", "round_rect", "rect"}
+        and isinstance(element.get("bbox"), list)
+        and len(element["bbox"]) == 4
+    ]
+    icon_elements = {
+        str(element.get("asset")): element
+        for element in elements
+        if element.get("type") == "icon" and element.get("asset") and isinstance(element.get("bbox"), list)
+    }
+    annotated = []
+    for query in queries:
+        item = dict(query)
+        icon = icon_elements.get(str(item.get("name")))
+        if not icon:
+            annotated.append(item)
+            continue
+        ix, iy, iw, ih = [float(value) for value in icon["bbox"]]
+        if iw <= 0 or ih <= 0:
+            annotated.append(item)
+            continue
+        cx = ix + iw / 2
+        cy = iy + ih / 2
+        containing_shapes = []
+        for shape in shapes:
+            sx, sy, sw, sh = [float(value) for value in shape["bbox"]]
+            if sw < iw * 1.15 or sh < ih * 1.15:
+                continue
+            if sw > iw * 2.4 or sh > ih * 2.4:
+                continue
+            shape_cx = sx + sw / 2
+            shape_cy = sy + sh / 2
+            if abs(shape_cx - cx) > sw * 0.25 or abs(shape_cy - cy) > sh * 0.25:
+                continue
+            if sx <= cx <= sx + sw and sy <= cy <= sy + sh:
+                containing_shapes.append((sw * sh, shape))
+        if containing_shapes:
+            _, container = min(containing_shapes, key=lambda value: value[0])
+            item["renderer_draws_container"] = True
+            item["container_bbox"] = [int(round(value)) for value in container["bbox"]]
+            item["container_shape"] = str(container.get("shape") or "shape")
+        annotated.append(item)
+    return annotated
 
 
 def make_chroma_key_transparent(path: Path, chroma_key: tuple[int, int, int]) -> None:
@@ -622,25 +808,50 @@ def make_chroma_key_transparent(path: Path, chroma_key: tuple[int, int, int]) ->
         make_background_transparent(path)
 
 
-def generation_prompt(query: dict, reference: SourceReference) -> str:
+def generation_prompt(query: dict, reference: SourceReference, *, source_matte: bool = False) -> str:
     icon_id, label = semantic_icon(query)
     chroma_hex = rgb_to_hex(reference.chroma_key)
+    background_guidance = (
+        "Use the same flat source-matched matte/background visible around the icon in the reference crop. "
+        "That matte may remain in the final asset; do not use an artificial chroma-key background. "
+    )
+    if not source_matte:
+        background_guidance = (
+            f"Use a perfectly flat {chroma_hex} chroma-key background everywhere outside the icon artwork. "
+            "Do not use the chroma-key color inside the icon artwork."
+        )
+    container_guidance = ""
+    if bool_value(query.get("renderer_draws_container", False)):
+        container_guidance = (
+            "The editable slide renderer already draws the surrounding badge/container "
+            f"({query.get('container_shape', 'shape')} at {query.get('container_bbox')}). "
+            "Return only the foreground pictogram/glyph from the source crop. "
+            "Do not include a circle, halo, background disk, badge, panel, or other container in the generated asset. "
+            "Scale the foreground pictogram so it fills the transparent canvas with balanced padding. "
+        )
     return (
         "Recreate the pictogram/icon shown in the attached source crop as a clean reusable presentation asset. "
         f"Canonical icon id: {icon_id}. Subject: {label}. "
-        "The attached crop is the visual authority: preserve its colors, stroke weight, fill style, "
-        "badge/container shape, proportions, and visual density. "
+        "The attached crop is the visual authority: preserve its colors, stroke weight, fill style, proportions, and visual density. "
+        f"{palette_prompt_text(reference.palette)}"
+        f"{container_guidance}"
+        "If no separate renderer-owned container is provided, preserve the source crop's visible icon container when it is part of the icon artwork. "
         "If the crop includes nearby labels, text, page background, crop edges, or noise, ignore those artifacts and keep only the icon artwork. "
         "Do not invent a different palette, design system, badge color, or icon style. "
         "No readable words, letters, numbers, brand marks, logos, watermark, UI text, or shadow. "
-        f"Use a perfectly flat {chroma_hex} chroma-key background everywhere outside the icon artwork. "
-        "Do not use the chroma-key color inside the icon artwork."
+        f"{background_guidance}"
     )
 
 
-def generated_library_paths(icon_id: str, reference_hash: str) -> tuple[Path, Path, Path]:
+def icon_prompt_version(query: dict) -> str:
+    if bool_value(query.get("renderer_draws_container", False)):
+        return CONTAINER_ICON_PROMPT_VERSION
+    return DEFAULT_ICON_PROMPT_VERSION
+
+
+def generated_library_paths(icon_id: str, reference_hash: str, prompt_version: str) -> tuple[Path, Path, Path]:
     library_dir = GENERATED_ICON_LIBRARY_DIR / "source_reference" / safe_name(icon_id)
-    library_stem = f"{reference_hash}__{ICON_PROMPT_VERSION}"
+    library_stem = f"{reference_hash}__{prompt_version}"
     return library_dir, library_dir / f"{library_stem}.png", library_dir / f"{library_stem}.json"
 
 
@@ -654,7 +865,7 @@ def can_generate_asset(query: dict, mode: str, reference: SourceReference | None
     if mode == "generate":
         return True
     icon_id, _ = semantic_icon(query)
-    _, library_path, _ = generated_library_paths(icon_id, reference.image_hash)
+    _, library_path, _ = generated_library_paths(icon_id, reference.image_hash, icon_prompt_version(query))
     if library_path.exists():
         return True
     return bool(os.getenv("OPENAI_API_KEY"))
@@ -670,6 +881,7 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
     icon_id, label = semantic_icon(query)
     style = icon_style(query)
     chroma_hex = rgb_to_hex(reference.chroma_key)
+    prompt_version = icon_prompt_version(query)
     cache_key = hashlib.sha256(
         json.dumps(
             {
@@ -679,37 +891,54 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
                 "icon_id": icon_id,
                 "style": style,
                 "reference_hash": reference.image_hash,
-                "prompt_version": ICON_PROMPT_VERSION,
+                "reference_palette": reference.palette,
+                "renderer_draws_container": bool_value(query.get("renderer_draws_container", False)),
+                "prompt_version": prompt_version,
                 "prompt": prompt,
             },
             sort_keys=True,
         ).encode("utf-8")
     ).hexdigest()[:24]
-    library_dir, library_path, manifest_path = generated_library_paths(icon_id, reference.image_hash)
+    library_dir, library_path, manifest_path = generated_library_paths(icon_id, reference.image_hash, prompt_version)
     if library_path.exists():
         shutil.copyfile(library_path, final_path)
         padding_metrics = normalize_transparent_padding(final_path)
         artwork_metrics = generated_icon_artwork_metrics(final_path, reference.chroma_key)
         artwork_metrics["padding_normalization"] = padding_metrics
-        return {
-            "path": relative_to_repo(final_path),
-            "bbox": None,
-            "anchor_text": query.get("anchor_text"),
-            "source": "generated_icon_library",
-            "icon_id": icon_id,
-            "icon_style": style,
-            "semantic_label": label,
-            "generation_prompt": prompt,
-            "prompt_version": ICON_PROMPT_VERSION,
-            "source_reference": relative_to_repo(reference.path),
-            "source_reference_hash": reference.image_hash,
-            "source_reference_bbox": [int(value) for value in reference.bbox],
-            "source_reference_type": reference.source,
-            "chroma_key": chroma_hex,
-            "cache_key": cache_key,
-            "generation_metrics": artwork_metrics,
-            "library_reused": True,
-        }
+        palette_check = validate_generated_palette(final_path, reference)
+        artwork_metrics["palette_check"] = palette_check
+        if palette_check["ok"]:
+            return {
+                "path": relative_to_repo(final_path),
+                "bbox": None,
+                "anchor_text": query.get("anchor_text"),
+                "source": "generated_icon_library",
+                "icon_id": icon_id,
+                "icon_style": style,
+                "semantic_label": label,
+                "generation_prompt": prompt,
+                "prompt_version": prompt_version,
+                "source_reference": relative_to_repo(reference.path),
+                "source_reference_hash": reference.image_hash,
+                "source_reference_bbox": [int(value) for value in reference.bbox],
+                "source_reference_type": reference.source,
+                "renderer_draws_container": bool_value(query.get("renderer_draws_container", False)),
+                "container_bbox": query.get("container_bbox"),
+                "container_shape": query.get("container_shape"),
+                "chroma_key": chroma_hex,
+                "source_palette": reference.palette,
+                "cache_key": cache_key,
+                "generation_metrics": artwork_metrics,
+                "library_reused": True,
+            }
+        print(
+            "warning: cached generated icon introduced absent source color families; regenerating "
+            f"{query['name']}: {', '.join(palette_check['violations'])}",
+            file=sys.stderr,
+        )
+        final_path.unlink(missing_ok=True)
+        library_path.unlink(missing_ok=True)
+        manifest_path.unlink(missing_ok=True)
 
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is required to generate a missing icon")
@@ -734,12 +963,39 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
         str(raw_path),
         "--force",
     ]
-    subprocess.run(cmd, check=True)
-    raw_path.replace(final_path)
-    make_chroma_key_transparent(final_path, reference.chroma_key)
-    padding_metrics = normalize_transparent_padding(final_path)
-    artwork_metrics = generated_icon_artwork_metrics(final_path, reference.chroma_key)
-    artwork_metrics["padding_normalization"] = padding_metrics
+    last_palette_check: dict[str, Any] | None = None
+    strategies = ["chroma"] * ICON_GENERATION_ATTEMPTS + ["source_matte"] * ICON_SOURCE_MATTE_ATTEMPTS
+    background_mode = "chroma"
+    for attempt, strategy in enumerate(strategies, start=1):
+        source_matte = strategy == "source_matte"
+        background_mode = strategy
+        attempt_prompt = generation_prompt(query, reference, source_matte=source_matte)
+        if last_palette_check and last_palette_check.get("violations"):
+            attempt_prompt = (
+                attempt_prompt
+                + " Previous generated attempt introduced absent source color families: "
+                + ", ".join(str(item) for item in last_palette_check["violations"])
+                + ". Regenerate using only the colors visible in the source crop."
+            )
+        cmd[cmd.index("--prompt") + 1] = attempt_prompt
+        subprocess.run(cmd, check=True)
+        raw_path.replace(final_path)
+        if not source_matte:
+            make_chroma_key_transparent(final_path, reference.chroma_key)
+        padding_metrics = normalize_transparent_padding(final_path)
+        artwork_metrics = generated_icon_artwork_metrics(final_path, reference.chroma_key)
+        artwork_metrics["padding_normalization"] = padding_metrics
+        artwork_metrics["background_mode"] = background_mode
+        palette_check = validate_generated_palette(final_path, reference)
+        artwork_metrics["palette_check"] = palette_check
+        if palette_check["ok"]:
+            break
+        last_palette_check = palette_check
+        final_path.unlink(missing_ok=True)
+        if attempt == len(strategies):
+            raise RuntimeError(
+                f"generated icon introduced absent source color families: {', '.join(palette_check['violations'])}"
+            )
     library_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(final_path, library_path)
     manifest_path.write_text(
@@ -751,11 +1007,16 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
                 "model": model,
                 "size": size,
                 "quality": quality,
-                "prompt_version": ICON_PROMPT_VERSION,
+                "prompt_version": prompt_version,
                 "source_reference_hash": reference.image_hash,
                 "source_reference_bbox": [int(value) for value in reference.bbox],
                 "source_reference_type": reference.source,
+                "source_palette": reference.palette,
+                "renderer_draws_container": bool_value(query.get("renderer_draws_container", False)),
+                "container_bbox": query.get("container_bbox"),
+                "container_shape": query.get("container_shape"),
                 "chroma_key": chroma_hex,
+                "background_mode": background_mode,
                 "generation_metrics": artwork_metrics,
                 "cache_key": cache_key,
                 "generation_prompt": prompt,
@@ -773,12 +1034,17 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
         "icon_style": style,
         "semantic_label": label,
         "generation_prompt": prompt,
-        "prompt_version": ICON_PROMPT_VERSION,
+        "prompt_version": prompt_version,
         "source_reference": relative_to_repo(reference.path),
         "source_reference_hash": reference.image_hash,
         "source_reference_bbox": [int(value) for value in reference.bbox],
         "source_reference_type": reference.source,
+        "source_palette": reference.palette,
+        "renderer_draws_container": bool_value(query.get("renderer_draws_container", False)),
+        "container_bbox": query.get("container_bbox"),
+        "container_shape": query.get("container_shape"),
         "chroma_key": chroma_hex,
+        "background_mode": background_mode,
         "generation_metrics": artwork_metrics,
         "cache_key": cache_key,
         "library_reused": False,
@@ -795,9 +1061,8 @@ def main() -> None:
         choices=["extract", "auto", "generate"],
         default="auto",
         help=(
-            "auto: generate generatable assets when OPENAI_API_KEY exists, otherwise "
-            "fall back to Vision/OpenCV extraction. extract: Vision/OpenCV only. "
-            "generate: require generation for generatable assets."
+            "auto/generate: require generated-library output for generatable icons. "
+            "extract: crop only non-generatable raster assets; generatable icons fail."
         ),
     )
     parser.add_argument("--update-spec", action="store_true")
@@ -809,7 +1074,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     spec = json.loads(spec_path.read_text())
-    queries = spec.get("asset_queries", [])
+    queries = annotate_queries_with_render_context(spec, spec.get("asset_queries", []))
     if not queries:
         raise SystemExit(f"{spec_path} has no asset_queries")
 
@@ -822,29 +1087,34 @@ def main() -> None:
     manifest = {"source_size": [int(img.shape[1]), int(img.shape[0])], "assets": {}}
     for query in queries:
         name = query["name"]
-        existing_path = existing_asset_path(assets.get(name, {}))
+        is_generatable = bool_value(query.get("generatable", False))
+        existing_asset = assets.get(name, {})
+        existing_path = existing_asset_path(existing_asset)
         if existing_path is not None:
-            manifest["assets"][name] = assets[name]
-            print(f"{name}: reused {existing_path}")
-            continue
-
-        reference = None
-        if args.asset_mode != "extract" and bool_value(query.get("generatable", False)):
-            reference = source_reference_for_query(query, out_dir, image_path, img)
-            if args.asset_mode == "generate" and reference is None:
-                raise RuntimeError(f"source reference crop is required to generate asset {name}")
-        if can_generate_asset(query, args.asset_mode, reference):
-            try:
-                asset = generate_asset(query, out_dir, reference)
-                assets[name] = asset
-                manifest["assets"][name] = asset
-                action = "reused generated icon" if asset.get("library_reused") else "generated"
-                print(f"{name}: {action}")
+            if is_generatable and existing_asset.get("source") != "generated_icon_library":
+                print(
+                    f"warning: ignoring non-generated existing asset for final-quality icon {name}: "
+                    f"{existing_asset.get('source')}",
+                    file=sys.stderr,
+                )
+                assets.pop(name, None)
+            else:
+                manifest["assets"][name] = assets[name]
+                print(f"{name}: reused {existing_path}")
                 continue
-            except Exception as exc:
-                if args.asset_mode == "generate":
-                    raise
-                print(f"warning: generation failed for {name}; falling back to Vision extraction: {exc}", file=sys.stderr)
+
+        if is_generatable:
+            if args.asset_mode == "extract":
+                raise RuntimeError(f"asset-mode extract cannot produce final-quality generated icon {name}")
+            reference = source_reference_for_query(query, out_dir, image_path, img)
+            if reference is None:
+                raise RuntimeError(f"source reference crop is required to generate final-quality icon {name}")
+            asset = generate_asset(query, out_dir, reference)
+            assets[name] = asset
+            manifest["assets"][name] = assets[name]
+            action = "reused generated icon" if asset.get("library_reused") else "generated"
+            print(f"{name}: {action}")
+            continue
 
         direct_bbox = query_bbox_crop(query, img)
         icon_id, icon_label = semantic_icon(query)

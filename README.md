@@ -148,11 +148,13 @@ This will:
 2. Extract declared logo assets from the source image.
 3. Verify the generated spec and print non-fatal warnings.
 4. Render an editable `.pptx`.
+5. Run two preview/refinement iterations by default for visual-quality runs.
 
 The default `--spec-layout` is `generic_slide`. The model may emit a
 `generic_deck` when the source image is too dense for one readable slide.
 
-For visual QA, add one or more refinement iterations:
+For fast layout checks, pass `--refine 0`. For visual QA, keep the default
+refinement loop or set the desired iteration count explicitly:
 
 ```bash
 .venv/bin/python src/run_pipeline.py \
@@ -188,6 +190,10 @@ Helper images are reference-only. The source slide remains the authority for
 copy and meaning; style guides and template previews can influence palette,
 typography, spacing, card treatments, and icon treatment.
 
+Use `--scratch-dir` for repeatable test runs that should not leave intermediate
+specs, extracted assets, or generated icon cache files in the repo. Final PPTX
+files and rendered PNG previews remain in `--output-dir`.
+
 To rerender an existing spec without rerunning OCR or OpenAI calls:
 
 ```bash
@@ -195,7 +201,8 @@ To rerender an existing spec without rerunning OCR or OpenAI calls:
   images/source.png \
   specs/source.auto.json \
   output/source.pptx \
-  --skip-assets
+  --skip-assets \
+  --refine 0
 ```
 
 ## Full Deck Batch Flow
@@ -210,18 +217,29 @@ deck:
   --output-dir output/auto \
   --combined output/all_slides_auto.pptx \
   --force-spec \
-  --refine 1
+  --refine 2
 ```
 
-For a fast layout-QA pass without generated/cropped generic icons, add
-`--skip-generic-assets`. In that mode real logos are still extracted, but
-generic icons are drawn with editable placeholder PowerPoint shapes.
+For a fast layout-only QA pass without generated generic icons, add
+`--refine 0 --skip-generic-assets`. In that mode real logos are still
+extracted, but generic icons are drawn with editable placeholder PowerPoint
+shapes. Do not use that mode for final visual-quality review.
 
 Useful narrower runs:
 
 ```bash
 .venv/bin/python src/run_batch.py --start 23 --end 25 --force-spec
 .venv/bin/python src/run_batch.py --limit 3 --force-spec
+.venv/bin/python src/run_batch.py \
+  --slides 1,26-28 \
+  --output-dir output/helper_tests \
+  --combined output/helper_tests/helper_test_1_26_27_28.pptx \
+  --scratch-dir /private/tmp/slidegen_helper_test \
+  --asset-mode generate \
+  --spec-model gpt-5.5 \
+  --refine-model gpt-5.5 \
+  --style-guide-image "New Brand Mini Style Guide (1).png" \
+  --template-pptx "Copy of Obsidian Template Deck 2026.pptx"
 ```
 
 ## Prompts
@@ -254,18 +272,23 @@ Use this order:
    the image, then imagegen cleans/recreates that exact visual treatment.
    Cached generated icons are keyed by the source reference crop, not by a
    global style enum.
-4. Vision/OpenCV source crops as fallback for generic pictograms when generation
-   is unavailable, disabled, or fails. Crop quality checks reject obviously bad
-   icon crops.
-5. Native PowerPoint placeholder icons only for layout QA or missing assets.
+   The source crop also drives palette constraints. If an artificial chroma
+   background contaminates the artwork, the asset step retries and may keep a
+   source-matched matte when that better preserves the original visual
+   treatment.
+4. Generic pictograms must not use source crops as final rendered assets. If a
+   generated icon cannot be produced, the final-quality run fails before the
+   renderer can substitute a native placeholder.
+5. Native PowerPoint placeholder icons are only for explicit layout QA via
+   `--skip-generic-assets`, not for final visual-quality review.
 
 Image generation is not used to create full slides, charts, tables, real logos, or editable labels.
 The asset code does not infer icon meaning from regexes or alias tables. The
 spec LLM owns semantic normalization by emitting `icon_id`; if that field is
-missing, the asset pipeline only falls back to the asset name. `icon_style` is
-free-form source-observed treatment text, not an enum. The generic icon prompt
-is centralized in `src/extract_assets_vision.py`, but the source crop is the
-visual authority.
+missing, the asset pipeline uses the asset name as the default identifier.
+`icon_style` is free-form source-observed treatment text, not an enum. The
+generic icon prompt is centralized in `src/extract_assets_vision.py`, but the
+source crop is the visual authority.
 
 ## Security Notes
 

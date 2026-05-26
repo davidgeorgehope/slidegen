@@ -1,6 +1,6 @@
 Create a `generic_slide` JSON spec.
 
-This layout is the default fallback for any slide screenshot. It should be
+This layout is the default layout for any slide screenshot. It should be
 usable across title slides, diagrams, grids, tables, timelines, callouts,
 comparison slides, dense product slides, and architecture slides.
 
@@ -146,7 +146,8 @@ Field guidance:
 - Image generation is the primary path for generic icons when `OPENAI_API_KEY`
   exists; the asset pipeline first crops the source icon reference from `bbox`
   or `anchor_text`, then uses that source crop as the imagegen reference.
-  Vision/source-crop output remains the fallback.
+  Source crops are references for image generation only; they must not appear as
+  final rendered generic icon assets.
 - Do not emit per-icon `generation_prompt` text. The asset pipeline builds a
   standardized prompt from the source reference crop, `icon_id`, optional
   `icon_style`, and `semantic_label` so the icon follows the source image.
@@ -154,7 +155,8 @@ Field guidance:
   `logo_assets` with visible OCR text in `match`.
 - Use `type: "image"` only for non-editable source visual material that should
   remain raster, such as screenshots, photos, UI captures, or complex brand
-  marks. Add an `asset_queries` item with a `bbox` for direct crop fallback.
+  marks. Add an `asset_queries` item with a `bbox` only when that raster crop is
+  intended to remain in the final slide.
 - Color values can be six-digit hex strings with or without `#`, or keys from
   `theme`.
 - Keep the element count practical. Capture important layout and copy first.

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -443,10 +444,13 @@ def draw_symbol(slide, bbox: list[int], hint: str, accent: str, source: tuple[in
 
 
 def render_icon(slide, element: dict[str, Any], spec: dict[str, Any], base_dir: Path, theme: dict[str, str], source: tuple[int, int]):
-    path = spec_asset_path(spec, base_dir, element.get("asset"))
+    asset_name = element.get("asset")
+    path = spec_asset_path(spec, base_dir, asset_name)
     left, top, width, height = px_box(element["bbox"], source)
     if path:
         return add_contained_picture(slide, path, left=left, top=top, width=width, height=height)
+    if asset_name and not bool_value(os.getenv("SLIDEGEN_ALLOW_NATIVE_ICON_PLACEHOLDERS")):
+        raise RuntimeError(f"icon `{asset_name}` has no generated asset; refusing native placeholder render")
 
     x, y, w, h = element["bbox"]
     accent = theme_value(theme, element.get("color"), "accent_color") or theme["accent_color"]
