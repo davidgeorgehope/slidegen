@@ -97,6 +97,8 @@ def pipeline_cmd(args, image_path: Path, spec_path: Path, out_path: Path) -> lis
     ]
     if args.spec_model:
         cmd.extend(["--spec-model", args.spec_model])
+    if args.spec_refine is not None:
+        cmd.extend(["--spec-refine", str(args.spec_refine)])
     for helper in args.style_guide_image:
         cmd.extend(["--style-guide-image", helper])
     if args.template_pptx:
@@ -105,14 +107,12 @@ def pipeline_cmd(args, image_path: Path, spec_path: Path, out_path: Path) -> lis
         cmd.extend(["--extract-root", args.extract_root])
     if args.icon_library_dir:
         cmd.extend(["--icon-library-dir", args.icon_library_dir])
-    if args.refine:
+    if args.icon_generation_input:
+        cmd.extend(["--icon-generation-input", args.icon_generation_input])
+    if args.refine is not None:
         cmd.extend(["--refine", str(args.refine)])
     if args.refine_model:
         cmd.extend(["--refine-model", args.refine_model])
-    if args.force_spec:
-        cmd.extend(["--generate-spec", "--force-spec"])
-    elif not spec_path.exists():
-        cmd.append("--generate-spec")
     if args.skip_assets:
         cmd.append("--skip-assets")
     if args.skip_generic_assets:
@@ -161,8 +161,10 @@ def main() -> None:
     parser.add_argument("--output-dir", default="output/auto")
     parser.add_argument("--combined", default="output/all_slides_auto.pptx")
     parser.add_argument("--asset-mode", choices=["auto", "extract", "generate"], default="auto")
-    parser.add_argument("--spec-layout", default="generic_slide")
+    parser.add_argument("--icon-generation-input", choices=["source", "description"], default="description")
+    parser.add_argument("--spec-layout", choices=["generic_slide", "generic_deck"], default="generic_slide")
     parser.add_argument("--spec-model", default=None)
+    parser.add_argument("--spec-refine", type=int, default=1)
     parser.add_argument("--style-guide-image", action="append", default=[])
     parser.add_argument("--template-pptx", default=None)
     parser.add_argument("--refine", type=int, default=2)
@@ -173,7 +175,6 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--scratch-dir", default=None, help="scratch root for specs/assets/icon cache")
     parser.add_argument("--keep-scratch", action="store_true")
-    parser.add_argument("--force-spec", action="store_true")
     parser.add_argument("--skip-assets", action="store_true")
     parser.add_argument(
         "--skip-generic-assets",

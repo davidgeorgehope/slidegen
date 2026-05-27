@@ -1,7 +1,7 @@
 """Generate a slide JSON spec from a PNG using the OpenAI API.
 
 The output is intentionally a spec, not a rendered slide. Rendering stays in
-the deterministic layout-specific renderers.
+the deterministic generic renderer.
 """
 from __future__ import annotations
 
@@ -48,46 +48,6 @@ DEFAULT_HEADER = {
 }
 
 
-ARCHITECTURE_SPEC_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": True,
-    "required": [
-        "slide",
-        "source_size",
-        "layout",
-        "left_panel",
-        "devices",
-        "layers",
-        "saas_panel",
-        "parallel_layer",
-        "callout",
-        "logo_assets",
-    ],
-    "properties": {
-        "slide": {"type": "string"},
-        "source_size": {
-            "type": "array",
-            "items": {"type": "integer"},
-            "minItems": 2,
-            "maxItems": 2,
-        },
-        "layout": {"type": "string", "enum": ["architecture_parallel_layers"]},
-        "theme": {"type": "object"},
-        "fonts": {"type": "object"},
-        "header": {"type": "object"},
-        "left_panel": {"type": "object"},
-        "devices": {"type": "array", "items": {"type": "object"}},
-        "layers": {"type": "array", "items": {"type": "object"}},
-        "saas_panel": {"type": "object"},
-        "parallel_layer": {"type": "object"},
-        "callout": {"type": "object"},
-        "logo_assets": {"type": "array", "items": {"type": "object"}},
-        "asset_queries": {"type": "array", "items": {"type": "object"}},
-        "assets": {"type": "object"},
-    },
-}
-
-
 GENERIC_SPEC_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": True,
@@ -122,8 +82,6 @@ GENERIC_SPEC_SCHEMA: dict[str, Any] = {
 
 
 def schema_for_layout(layout: str) -> dict[str, Any]:
-    if layout == "architecture_parallel_layers":
-        return ARCHITECTURE_SPEC_SCHEMA
     if layout in {"generic_slide", "generic_deck"}:
         return GENERIC_SPEC_SCHEMA
     raise ValueError(f"Unsupported layout: {layout}")
@@ -407,25 +365,7 @@ def postprocess_spec(spec: dict[str, Any], image_path: Path, layout: str) -> dic
         validate_spec(spec)
         return spec
 
-    for layer in spec.get("layers", []):
-        if not isinstance(layer, dict):
-            continue
-        layer["bbox"] = normalize_bbox(layer.get("bbox"), [577, 202, 774, 112])
-        layer.setdefault("accent", "accent_color")
-        layer["logos"] = [clean_name(str(name)) for name in layer.get("logos", []) if str(name).strip()]
-
-    if isinstance(spec.get("saas_panel"), dict):
-        spec["saas_panel"]["bbox"] = normalize_bbox(spec["saas_panel"].get("bbox"), [1455, 172, 183, 480])
-        spec["saas_panel"]["logos"] = [
-            clean_name(str(name)) for name in spec["saas_panel"].get("logos", []) if str(name).strip()
-        ]
-    if isinstance(spec.get("parallel_layer"), dict):
-        spec["parallel_layer"]["bbox"] = normalize_bbox(spec["parallel_layer"].get("bbox"), [577, 679, 1060, 128])
-    if isinstance(spec.get("callout"), dict):
-        spec["callout"]["bbox"] = normalize_bbox(spec["callout"].get("bbox"), [381, 831, 1063, 84])
-
-    validate_spec(spec)
-    return spec
+    raise ValueError(f"Unsupported generated layout: {spec['layout']}")
 
 
 def validate_spec(spec: dict[str, Any]) -> None:
@@ -471,21 +411,7 @@ def validate_spec(spec: dict[str, Any]) -> None:
                 raise ValueError(f"Generated generic deck slide {idx} has no elements")
         return
 
-    required = [
-        "left_panel",
-        "devices",
-        "layers",
-        "saas_panel",
-        "parallel_layer",
-        "callout",
-    ]
-    missing = [key for key in required if key not in spec]
-    if missing:
-        raise ValueError(f"Generated spec missing required keys: {', '.join(missing)}")
-    if spec["layout"] != "architecture_parallel_layers":
-        raise ValueError(f"Unsupported generated layout: {spec['layout']}")
-    if not spec["layers"]:
-        raise ValueError("Generated architecture spec has no layers")
+    raise ValueError(f"Unsupported generated layout: {spec['layout']}")
 
 
 def generate_spec(
@@ -498,10 +424,7 @@ def generate_spec(
 ) -> dict[str, Any]:
     system_prompt = read_prompt("system.md")
     schema = schema_for_layout(layout)
-    if layout == "architecture_parallel_layers":
-        layout_prompt = read_prompt("architecture_parallel_layers.md")
-    else:
-        layout_prompt = read_prompt("generic_slide.md")
+    layout_prompt = read_prompt("generic_slide.md")
     ocr_context = vision_ocr_context(image_path) if include_ocr else "OCR omitted."
     user_prompt = (
         f"{layout_prompt}\n\n"
@@ -556,19 +479,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("image")
     parser.add_argument("output_spec")
-    parser.add_argument("--layout", default="generic_slide")
+    parser.add_argument("--layout", choices=["generic_slide", "generic_deck"], default="generic_slide")
     parser.add_argument("--model", default=None)
     parser.add_argument("--no-ocr", action="store_true")
     parser.add_argument("--style-guide-image", action="append", default=[], help="optional brand/style guide image")
     parser.add_argument("--template-pptx", default=None, help="optional template deck to render as a style reference")
-    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     load_env(ROOT / ".env")
     image_path = Path(args.image)
     out_path = Path(args.output_spec)
-    if out_path.exists() and not args.force:
-        raise SystemExit(f"{out_path} exists; pass --force to overwrite")
 
     helper_images = [(f"style guide: {Path(path).name}", Path(path)) for path in args.style_guide_image]
     model = args.model or os.environ.get("OPENAI_SPEC_MODEL") or os.environ.get("OPENAI_MODEL") or DEFAULT_SPEC_MODEL

@@ -51,10 +51,28 @@ REFINEMENT_SCHEMA: dict[str, Any] = {
                 "properties": {
                     "op": {
                         "type": "string",
-                        "enum": ["set_bbox", "shift_bbox", "set_font_size", "scale_text_group"],
+                        "enum": [
+                            "set_bbox",
+                            "shift_bbox",
+                            "set_font_size",
+                            "scale_text_group",
+                            "regenerate_icon",
+                            "set_line_points",
+                            "add_line",
+                            "add_shape",
+                        ],
                     },
+                    "container_path": {"type": "string"},
                     "path": {"type": "string"},
                     "paths": {"type": "array", "items": {"type": "string"}},
+                    "asset": {"type": "string"},
+                    "guidance": {"type": "string"},
+                    "points": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 4,
+                        "maxItems": 4,
+                    },
                     "bbox": {
                         "type": "array",
                         "items": {"type": "number"},
@@ -65,6 +83,14 @@ REFINEMENT_SCHEMA: dict[str, Any] = {
                     "dy": {"type": "number"},
                     "font_size": {"type": "number"},
                     "scale": {"type": "number"},
+                    "shape": {"type": "string"},
+                    "fill": {"type": "string"},
+                    "stroke": {"type": "string"},
+                    "stroke_width": {"type": "number"},
+                    "dash": {"type": "boolean"},
+                    "arrow": {"type": "boolean"},
+                    "z": {"type": "number"},
+                    "radius": {"type": "number"},
                     "reason": {"type": "string"},
                 },
             },
@@ -108,6 +134,44 @@ def text_preview(text: Any, limit: int = 90) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "..."
 
 
+def visual_text_units(text: str) -> float:
+    units = 0.0
+    for char in text:
+        if char.isspace():
+            units += 0.35
+        elif char in ".,;:!/()[]{}|":
+            units += 0.45
+        elif char in "-–—":
+            units += 0.55
+        else:
+            units += 1.0
+    return max(1.0, units)
+
+
+def estimate_wrapped_lines(element: dict[str, Any]) -> int:
+    text = str(element.get("text") or "")
+    bbox = element.get("bbox") if isinstance(element.get("bbox"), list) else [0, 0, 1, 1]
+    width = max(1.0, float(bbox[2]))
+    role = str(element.get("role") or "body").lower()
+    try:
+        font_px = float(element.get("font_size"))
+    except (TypeError, ValueError):
+        font_px = 18.0 if role in {"title", "headline", "h1"} else 11.0
+    avg_char = 0.56 if role in {"title", "headline", "h1", "subtitle", "section", "h2", "heading"} else 0.48
+    lines = 0
+    for raw_line in text.splitlines() or [text]:
+        lines += max(1, int((visual_text_units(raw_line) * font_px * avg_char + width - 1) // width))
+    return max(1, lines)
+
+
+def asset_refs(spec: dict[str, Any]) -> list[tuple[str, str, str]]:
+    refs = []
+    for path, element in iter_elements(spec):
+        if element.get("type") in {"image", "icon"} and element.get("asset"):
+            refs.append((path, str(element["asset"]), str(element.get("type"))))
+    return refs
+
+
 def iter_elements(spec: dict[str, Any]):
     if spec.get("layout") == "generic_deck":
         for slide_idx, slide in enumerate(spec.get("slides", [])):
@@ -132,6 +196,8 @@ def element_catalog(spec: dict[str, Any]) -> str:
             "bbox": element.get("bbox"),
             "role": element.get("role"),
             "font_size": element.get("font_size"),
+            "asset": element.get("asset"),
+            "icon_hint": element.get("icon_hint"),
             "text": text_preview(element.get("text")),
             "z": element.get("z"),
         }
@@ -153,7 +219,15 @@ def intersection(a: list[int], b: list[int]) -> float:
 
 def lint_spec(spec: dict[str, Any]) -> list[str]:
     issues: list[str] = []
+    if spec.get("layout") not in {"generic_slide", "generic_deck"}:
+        issues.append(f"unsupported layout `{spec.get('layout')}`; main pipeline must generate generic_slide/generic_deck")
+
     source_w, source_h = source_size(spec)
+    assets = spec.get("assets", {}) if isinstance(spec.get("assets"), dict) else {}
+    for path, asset_name, element_type in asset_refs(spec):
+        if asset_name not in assets:
+            issues.append(f"{path}: {element_type} references missing asset `{asset_name}`")
+
     text_items = [
         (path, element)
         for path, element in iter_elements(spec)
@@ -166,6 +240,22 @@ def lint_spec(spec: dict[str, Any]) -> list[str]:
             issues.append(f"{path}: text bbox is partly off-slide: {element['bbox']}")
         if w < 16 or h < 10:
             issues.append(f"{path}: text bbox is very small: {element['bbox']}")
+        try:
+            font_px = float(element.get("font_size"))
+        except (TypeError, ValueError):
+            font_px = 11.0
+        line_capacity = max(1, int(h / max(1.0, font_px * 1.18)))
+        estimated_lines = estimate_wrapped_lines(element)
+        if estimated_lines > line_capacity:
+            issues.append(
+                f"{path}: text likely clips or wraps too tightly; estimated {estimated_lines} lines "
+                f"for {line_capacity}-line box, bbox={element['bbox']}, text=`{text_preview(element.get('text'), 65)}`"
+            )
+        longest_word = max((visual_text_units(word) for word in str(element.get("text") or "").split()), default=0.0)
+        if longest_word * font_px * 0.56 > w * 1.08:
+            issues.append(
+                f"{path}: longest word may not fit bbox width {w}; text=`{text_preview(element.get('text'), 65)}`"
+            )
 
     for idx, (path_a, element_a) in enumerate(text_items):
         bbox_a = element_a["bbox"]
@@ -258,6 +348,51 @@ def resolve_element(spec: dict[str, Any], path: str) -> dict[str, Any]:
     raise ValueError(f"unsupported element path: {path}")
 
 
+def resolve_elements_container(spec: dict[str, Any], path: str | None = None) -> list[dict[str, Any]]:
+    if spec.get("layout") == "generic_deck":
+        text = str(path or "").strip()
+        parts = parse_pointer(text) if text else ["slides", "0", "elements"]
+        if len(parts) == 3 and parts[0] == "slides" and parts[2] == "elements":
+            return spec["slides"][int(parts[1])]["elements"]
+        raise ValueError(f"unsupported elements container path: {path}")
+    if path and str(path).strip() not in {"", "/elements"}:
+        raise ValueError(f"unsupported elements container path: {path}")
+    return spec["elements"]
+
+
+def next_z(elements: list[dict[str, Any]]) -> int:
+    values = []
+    for element in elements:
+        try:
+            values.append(int(element.get("z")))
+        except (TypeError, ValueError):
+            pass
+    return (max(values) + 1) if values else 0
+
+
+def resolve_icon_element(spec: dict[str, Any], patch: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    path = str(patch.get("path") or "").strip()
+    if path:
+        return path, resolve_element(spec, path)
+
+    asset = str(patch.get("asset") or "").strip()
+    if not asset:
+        raise ValueError("regenerate_icon requires path or asset")
+    for element_path, element in iter_elements(spec):
+        if element.get("type") == "icon" and str(element.get("asset") or "") == asset:
+            return element_path, element
+    raise ValueError(f"no icon element references asset `{asset}`")
+
+
+def find_asset_query(spec: dict[str, Any], asset_name: str) -> dict[str, Any]:
+    for query in spec.get("asset_queries", []):
+        if not isinstance(query, dict):
+            continue
+        if str(query.get("name") or "") == asset_name or str(query.get("asset") or "") == asset_name:
+            return query
+    raise ValueError(f"no asset_query found for `{asset_name}`")
+
+
 def clamp_bbox(raw_bbox: Any, spec: dict[str, Any]) -> list[int]:
     if not isinstance(raw_bbox, list) or len(raw_bbox) != 4:
         raise ValueError("bbox must be [x,y,width,height]")
@@ -268,6 +403,43 @@ def clamp_bbox(raw_bbox: Any, spec: dict[str, Any]) -> list[int]:
     x = max(0, min(source_w - w, x))
     y = max(0, min(source_h - h, y))
     return [x, y, w, h]
+
+
+def clamp_points(raw_points: Any, spec: dict[str, Any]) -> list[int]:
+    if not isinstance(raw_points, list) or len(raw_points) != 4:
+        raise ValueError("points must be [x1,y1,x2,y2]")
+    source_w, source_h = source_size(spec)
+    x1, y1, x2, y2 = [int(round(float(value))) for value in raw_points]
+    x1 = max(0, min(source_w, x1))
+    x2 = max(0, min(source_w, x2))
+    y1 = max(0, min(source_h, y1))
+    y2 = max(0, min(source_h, y2))
+    if abs(x1 - x2) < 2 and abs(y1 - y2) < 2:
+        raise ValueError("line points are too short")
+    return [x1, y1, x2, y2]
+
+
+def clean_shape(value: Any) -> str:
+    shape = str(value or "rect").strip().lower().replace("-", "_")
+    if shape in {"roundrect", "rounded_rect", "rounded_rectangle"}:
+        return "round_rect"
+    if shape in {"rect", "round_rect", "ellipse"}:
+        return shape
+    return "rect"
+
+
+def clean_optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def clean_stroke_width(value: Any, default: float) -> float:
+    try:
+        return max(0.0, min(12.0, float(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 def role_min_font(element: dict[str, Any]) -> float:
@@ -347,6 +519,84 @@ def apply_patch(spec: dict[str, Any], patch: dict[str, Any]) -> str:
             raise ValueError("scale_text_group did not target text")
         return f"scale_text_group {applied} elements"
 
+    if op == "regenerate_icon":
+        path, element = resolve_icon_element(spec, patch)
+        if element.get("type") != "icon":
+            raise ValueError("regeneration target is not an icon")
+        asset_name = str(element.get("asset") or "").strip()
+        if not asset_name:
+            raise ValueError("icon target has no asset")
+        query = find_asset_query(spec, asset_name)
+        if not query.get("generatable", False):
+            raise ValueError(f"asset `{asset_name}` is not a generatable generic icon")
+        guidance = " ".join(str(patch.get("guidance") or patch.get("reason") or "").split())
+        if not guidance:
+            guidance = "Regenerate this generic icon to better match the source image and current slide context."
+        query["regenerate"] = True
+        query["regeneration_guidance"] = guidance
+        query["regeneration_reason"] = str(patch.get("reason") or "").strip()
+        try:
+            query["regeneration_round"] = int(query.get("regeneration_round") or 0) + 1
+        except (TypeError, ValueError):
+            query["regeneration_round"] = 1
+        assets = spec.get("assets")
+        if isinstance(assets, dict):
+            assets.pop(asset_name, None)
+        return f"regenerate_icon {path} asset={asset_name}"
+
+    if op == "set_line_points":
+        element = resolve_element(spec, str(patch.get("path") or ""))
+        if element.get("type") != "line":
+            raise ValueError("line point target is not a line")
+        element["points"] = clamp_points(patch.get("points"), spec)
+        if "dash" in patch:
+            element["dash"] = bool(patch.get("dash"))
+        if "arrow" in patch:
+            element["arrow"] = bool(patch.get("arrow"))
+        if patch.get("stroke"):
+            element["stroke"] = str(patch["stroke"]).strip().lstrip("#")
+        if "stroke_width" in patch:
+            element["stroke_width"] = clean_stroke_width(
+                patch.get("stroke_width"),
+                float(element.get("stroke_width", 1.0)),
+            )
+        return f"set_line_points {patch.get('path')}"
+
+    if op == "add_line":
+        elements = resolve_elements_container(spec, patch.get("container_path"))
+        element: dict[str, Any] = {
+            "type": "line",
+            "points": clamp_points(patch.get("points"), spec),
+            "stroke": clean_optional_text(patch.get("stroke")) or "2D73F5",
+            "stroke_width": clean_stroke_width(patch.get("stroke_width"), 1.5),
+            "dash": bool(patch.get("dash", False)),
+            "arrow": bool(patch.get("arrow", False)),
+            "z": int(round(float(patch.get("z")))) if patch.get("z") is not None else next_z(elements),
+        }
+        elements.append(element)
+        elements.sort(key=lambda item: item.get("z", 0))
+        return f"add_line {element['points']}"
+
+    if op == "add_shape":
+        elements = resolve_elements_container(spec, patch.get("container_path"))
+        element = {
+            "type": "shape",
+            "shape": clean_shape(patch.get("shape")),
+            "bbox": clamp_bbox(patch.get("bbox"), spec),
+            "fill": clean_optional_text(patch.get("fill")) or "transparent",
+            "stroke": clean_optional_text(patch.get("stroke")),
+            "stroke_width": clean_stroke_width(patch.get("stroke_width"), 0.75),
+            "z": int(round(float(patch.get("z")))) if patch.get("z") is not None else next_z(elements),
+        }
+        if patch.get("radius") is not None:
+            try:
+                element["radius"] = max(0.0, min(0.5, float(patch["radius"])))
+            except (TypeError, ValueError):
+                pass
+        elements.append(element)
+        elements.sort(key=lambda item: item.get("z", 0))
+        return f"add_shape {element['shape']} {element['bbox']}"
+
     raise ValueError(f"unsupported op: {op}")
 
 
@@ -375,9 +625,10 @@ def request_refinement(
     spec: dict[str, Any],
     *,
     model: str,
+    lint: list[str] | None = None,
 ) -> dict[str, Any]:
     prompt = PROMPT_PATH.read_text()
-    lint = lint_spec(spec)
+    lint = lint if lint is not None else lint_spec(spec)
     user_text = (
         f"{prompt}\n\n"
         "Element catalog. Use only these JSON pointer paths in patches:\n"
@@ -446,7 +697,12 @@ def main() -> None:
         return
 
     model = args.model or os.environ.get("OPENAI_REFINE_MODEL") or os.environ.get("OPENAI_SPEC_MODEL") or DEFAULT_REFINE_MODEL
-    response = request_refinement(Path(args.source_image), Path(args.rendered_preview), spec, model=model)
+    lint = lint_spec(spec)
+    if lint:
+        print("deterministic lint hints:")
+        for item in lint[:8]:
+            print(f"- {item}")
+    response = request_refinement(Path(args.source_image), Path(args.rendered_preview), spec, model=model, lint=lint)
     refined, applied, rejected = apply_refinement(spec, response)
 
     output_path = Path(args.output_spec)

@@ -30,9 +30,11 @@ assets for brand marks and source/library assets for vendor logos.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import math
+import mimetypes
 import os
 import re
 import shutil
@@ -46,6 +48,11 @@ from typing import Any
 import cv2
 import numpy as np
 from PIL import Image
+
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - optional until description mode is used
+    OpenAI = None
 
 from extract_logos_vision import (
     OCRBox,
@@ -64,14 +71,27 @@ CROP_PAD = 6
 IMAGE_GEN_CLI = Path.home() / ".codex/skills/.system/imagegen/scripts/image_gen.py"
 GENERATED_ICON_LIBRARY_DIR = Path(os.getenv("SLIDEGEN_ICON_LIBRARY_DIR", "extracted/generated_icon_library"))
 DEFAULT_ICON_PROMPT_VERSION = "v7"
-CONTAINER_ICON_PROMPT_VERSION = "v7"
+CONTAINER_ICON_PROMPT_VERSION = "v8"
+DESCRIPTION_ICON_PROMPT_VERSION = "v4"
+DEFAULT_ICON_GENERATION_INPUT = "description"
 CHROMA_KEY_CANDIDATES = ((255, 0, 255), (0, 255, 0), (255, 234, 0), (0, 255, 255))
 CHROMA_BORDER_DELTA = 80
 CHROMA_REMOVE_DELTA = 128
+CHROMA_INTERNAL_REMOVE_DELTA = 80
 CHROMA_ARTWORK_DELTA = 72
 ICON_GENERATION_ATTEMPTS = 2
 ICON_SOURCE_MATTE_ATTEMPTS = 1
+DEFAULT_ICON_ARTWORK_TARGET_COVERAGE = 0.92
+CONTAINER_ICON_ARTWORK_TARGET_COVERAGE = 0.94
 DEFAULT_ICON_STYLE = "source-matched presentation pictogram"
+DEFAULT_ICON_DESCRIBE_MODEL = "gpt-5.5"
+ICON_DESCRIPTION_ATTEMPTS = 3
+REGENERATION_QUERY_FIELDS = (
+    "regenerate",
+    "force_regenerate",
+    "regeneration_guidance",
+    "regeneration_reason",
+)
 
 
 @dataclass(frozen=True)
@@ -133,6 +153,45 @@ def bool_value(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y"}
     return bool(value)
+
+
+def regeneration_requested(query: dict) -> bool:
+    return bool_value(query.get("regenerate")) or bool_value(query.get("force_regenerate"))
+
+
+def regeneration_guidance(query: dict) -> str:
+    return " ".join(str(query.get("regeneration_guidance") or "").split())
+
+
+def regeneration_guidance_text(query: dict) -> str:
+    guidance = regeneration_guidance(query)
+    if not guidance:
+        return ""
+    return f"Visual QA correction guidance for this regeneration: {guidance} "
+
+
+def regeneration_metadata(query: dict) -> dict[str, Any]:
+    if not regeneration_requested(query):
+        return {}
+    metadata: dict[str, Any] = {"regenerated_from_refinement": True}
+    guidance = regeneration_guidance(query)
+    if guidance:
+        metadata["regeneration_guidance"] = guidance
+    reason = " ".join(str(query.get("regeneration_reason") or "").split())
+    if reason:
+        metadata["regeneration_reason"] = reason
+    return metadata
+
+
+def clear_regeneration_request(spec: dict, name: str) -> None:
+    for query in spec.get("asset_queries", []):
+        if not isinstance(query, dict):
+            continue
+        if str(query.get("name") or "") != name and str(query.get("asset") or "") != name:
+            continue
+        for field in REGENERATION_QUERY_FIELDS:
+            query.pop(field, None)
+        return
 
 
 def expand_bbox(bbox: tuple[int, int, int, int], pad: int, img: np.ndarray) -> tuple[int, int, int, int]:
@@ -427,6 +486,12 @@ def existing_asset_path(asset: dict) -> Path | None:
 
 def rgb_to_hex(color: tuple[int, int, int]) -> str:
     return f"#{color[0]:02X}{color[1]:02X}{color[2]:02X}"
+
+
+def image_data_url(image_path: Path) -> str:
+    mime = mimetypes.guess_type(str(image_path))[0] or "image/png"
+    encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
 
 
 def color_distance(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
@@ -803,47 +868,159 @@ def make_chroma_key_transparent(path: Path, chroma_key: tuple[int, int, int]) ->
     if remove.any():
         pixels[remove, :3] = 0
         pixels[remove, 3] = 0
-        Image.fromarray(pixels).save(path)
     else:
         make_background_transparent(path)
+        with Image.open(path).convert("RGBA") as image:
+            pixels = np.array(image)
+
+    key = np.array(chroma_key, dtype=np.int16)
+    delta = np.max(np.abs(pixels[..., :3].astype(np.int16) - key), axis=2)
+    internal_key = (pixels[..., 3] > 0) & (delta <= CHROMA_INTERNAL_REMOVE_DELTA)
+    if internal_key.any():
+        pixels[internal_key, :3] = 0
+        pixels[internal_key, 3] = 0
+    Image.fromarray(pixels).save(path)
+
+
+def background_guidance_for(reference: SourceReference, *, source_matte: bool = False) -> str:
+    chroma_hex = rgb_to_hex(reference.chroma_key)
+    if source_matte:
+        return (
+            "Use the same flat source-matched matte/background visible around the icon in the reference crop. "
+            "That matte may remain in the final asset; do not use an artificial chroma-key background. "
+        )
+    return (
+        f"Use a perfectly flat {chroma_hex} chroma-key background everywhere outside the icon artwork. "
+        "Do not use the chroma-key color inside the icon artwork."
+    )
+
+
+def describe_icon_reference(query: dict, reference: SourceReference) -> str:
+    if OpenAI is None:
+        raise RuntimeError("openai package is required for description-based icon generation")
+    icon_id, label = semantic_icon(query)
+    model = os.environ.get("OPENAI_ICON_DESCRIBE_MODEL") or os.environ.get("OPENAI_SPEC_MODEL") or DEFAULT_ICON_DESCRIBE_MODEL
+    container_context = ""
+    if bool_value(query.get("renderer_draws_container", False)):
+        container_context = (
+            "The slide renderer already draws the outer icon badge/container. "
+            "Describe the source-owned foreground artwork inside that outer container. "
+            "Treat any surrounding outer circle, halo, badge, matte, crop edge, or page background as context, "
+            "not artwork to reproduce. If a smaller centered colored disk or filled shape carries the pictogram "
+            "inside the crop, describe it as part of the icon artwork because it is not the outer renderer-owned badge. "
+        )
+    prompt = (
+        "Describe this small source icon for a separate image-generation model. "
+        "Return one concise paragraph, no JSON. Describe only visible visual facts: subject, shapes, "
+        "stroke/fill style, intentional badge or circular container if present, color families, "
+        "line weight, and approximate composition. Treat square crop boundaries, page background, "
+        "and incidental matte as context, not icon artwork; describe background only when it is "
+        "clearly a designed icon container. Do not infer brand logos or add text. "
+        f"{container_context}"
+        f"Canonical icon id: {icon_id}. Intended subject: {label}. "
+        f"Observed spec style hint: {icon_style(query)}. "
+        f"{regeneration_guidance_text(query)}"
+    )
+    client = OpenAI()
+    for attempt in range(1, ICON_DESCRIPTION_ATTEMPTS + 1):
+        attempt_prompt = prompt
+        if attempt > 1:
+            attempt_prompt += " The previous attempt returned empty text. Return one concise non-empty paragraph."
+        response = client.responses.create(
+            model=model,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": attempt_prompt},
+                        {"type": "input_image", "image_url": image_data_url(reference.path), "detail": "high"},
+                    ],
+                }
+            ],
+            text={"verbosity": "low"},
+            max_output_tokens=500,
+        )
+        description = response.output_text.strip()
+        if description:
+            return description
+        print(
+            f"warning: icon description model returned empty text for {query.get('name')} "
+            f"(attempt {attempt}/{ICON_DESCRIPTION_ATTEMPTS})",
+            file=sys.stderr,
+        )
+    raise RuntimeError("icon description model returned empty text after retries")
 
 
 def generation_prompt(query: dict, reference: SourceReference, *, source_matte: bool = False) -> str:
     icon_id, label = semantic_icon(query)
-    chroma_hex = rgb_to_hex(reference.chroma_key)
-    background_guidance = (
-        "Use the same flat source-matched matte/background visible around the icon in the reference crop. "
-        "That matte may remain in the final asset; do not use an artificial chroma-key background. "
-    )
-    if not source_matte:
-        background_guidance = (
-            f"Use a perfectly flat {chroma_hex} chroma-key background everywhere outside the icon artwork. "
-            "Do not use the chroma-key color inside the icon artwork."
-        )
     container_guidance = ""
     if bool_value(query.get("renderer_draws_container", False)):
         container_guidance = (
             "The editable slide renderer already draws the surrounding badge/container "
             f"({query.get('container_shape', 'shape')} at {query.get('container_bbox')}). "
-            "Return only the foreground pictogram/glyph from the source crop. "
-            "Do not include a circle, halo, background disk, badge, panel, or other container in the generated asset. "
-            "Scale the foreground pictogram so it fills the transparent canvas with balanced padding. "
+            "Do not include that outer renderer-owned container, page background, crop edge, panel, or matte in the asset. "
+            "Preserve source-owned inner artwork visible inside the icon crop, including a centered colored disk or filled "
+            "shape when it is part of the original icon treatment. "
+            "Scale the source-owned icon artwork so it fills the transparent canvas with balanced padding. "
         )
     return (
         "Recreate the pictogram/icon shown in the attached source crop as a clean reusable presentation asset. "
         f"Canonical icon id: {icon_id}. Subject: {label}. "
         "The attached crop is the visual authority: preserve its colors, stroke weight, fill style, proportions, and visual density. "
+        f"{regeneration_guidance_text(query)}"
         f"{palette_prompt_text(reference.palette)}"
         f"{container_guidance}"
         "If no separate renderer-owned container is provided, preserve the source crop's visible icon container when it is part of the icon artwork. "
         "If the crop includes nearby labels, text, page background, crop edges, or noise, ignore those artifacts and keep only the icon artwork. "
         "Do not invent a different palette, design system, badge color, or icon style. "
         "No readable words, letters, numbers, brand marks, logos, watermark, UI text, or shadow. "
-        f"{background_guidance}"
+        f"{background_guidance_for(reference, source_matte=source_matte)}"
     )
 
 
-def icon_prompt_version(query: dict) -> str:
+def description_generation_prompt(
+    query: dict,
+    reference: SourceReference,
+    description: str,
+    *,
+    source_matte: bool = False,
+) -> str:
+    icon_id, label = semantic_icon(query)
+    container_guidance = ""
+    if bool_value(query.get("renderer_draws_container", False)):
+        container_guidance = (
+            "The editable slide renderer already draws the surrounding badge/container "
+            f"({query.get('container_shape', 'shape')} at {query.get('container_bbox')}). "
+            "Do not include that outer renderer-owned container, page background, crop edge, panel, or matte in the asset. "
+            "Preserve source-owned inner artwork from the description, including a centered colored disk or filled shape "
+            "when it carries the icon's original visual treatment. "
+            "Scale the source-owned icon artwork so it fills the transparent canvas with balanced padding. "
+        )
+    preserve_guidance = (
+        "Preserve the described visual treatment, colors, proportions, and visual density. "
+        if bool_value(query.get("renderer_draws_container", False))
+        else "Preserve the described visual treatment, colors, proportions, intentional badge/container if described, and visual density. "
+    )
+    return (
+        "Create a clean reusable presentation icon from this visual description. "
+        f"Canonical icon id: {icon_id}. Subject: {label}. "
+        f"Visual description from the source icon: {description} "
+        f"{regeneration_guidance_text(query)}"
+        f"{palette_prompt_text(reference.palette)}"
+        f"{container_guidance}"
+        f"{preserve_guidance}"
+        "Do not preserve square crop boundaries, page background, or incidental matte as artwork. "
+        "Do not add readable words, letters, numbers, brand marks, logos, watermark, UI text, or shadow. "
+        f"{background_guidance_for(reference, source_matte=source_matte)}"
+    )
+
+
+def icon_prompt_version(query: dict, generation_input: str = DEFAULT_ICON_GENERATION_INPUT) -> str:
+    if generation_input == "description":
+        base = f"{DEFAULT_ICON_PROMPT_VERSION}_desc_{DESCRIPTION_ICON_PROMPT_VERSION}"
+        if bool_value(query.get("renderer_draws_container", False)):
+            return f"{base}_container"
+        return base
     if bool_value(query.get("renderer_draws_container", False)):
         return CONTAINER_ICON_PROMPT_VERSION
     return DEFAULT_ICON_PROMPT_VERSION
@@ -855,7 +1032,18 @@ def generated_library_paths(icon_id: str, reference_hash: str, prompt_version: s
     return library_dir, library_dir / f"{library_stem}.png", library_dir / f"{library_stem}.json"
 
 
-def can_generate_asset(query: dict, mode: str, reference: SourceReference | None) -> bool:
+def icon_artwork_target_coverage(query: dict) -> float:
+    if bool_value(query.get("renderer_draws_container", False)):
+        return CONTAINER_ICON_ARTWORK_TARGET_COVERAGE
+    return DEFAULT_ICON_ARTWORK_TARGET_COVERAGE
+
+
+def can_generate_asset(
+    query: dict,
+    mode: str,
+    reference: SourceReference | None,
+    generation_input: str = DEFAULT_ICON_GENERATION_INPUT,
+) -> bool:
     if mode == "extract":
         return False
     if not bool_value(query.get("generatable", False)):
@@ -865,23 +1053,36 @@ def can_generate_asset(query: dict, mode: str, reference: SourceReference | None
     if mode == "generate":
         return True
     icon_id, _ = semantic_icon(query)
-    _, library_path, _ = generated_library_paths(icon_id, reference.image_hash, icon_prompt_version(query))
+    _, library_path, _ = generated_library_paths(icon_id, reference.image_hash, icon_prompt_version(query, generation_input))
     if library_path.exists():
         return True
     return bool(os.getenv("OPENAI_API_KEY"))
 
 
-def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> dict | None:
+def generate_asset(
+    query: dict,
+    out_dir: Path,
+    reference: SourceReference,
+    *,
+    generation_input: str = DEFAULT_ICON_GENERATION_INPUT,
+) -> dict | None:
     raw_path = out_dir / f"{safe_name(query['name'])}_generated_raw.png"
     final_path = out_dir / f"{safe_name(query['name'])}.png"
-    prompt = generation_prompt(query, reference)
+    icon_description = describe_icon_reference(query, reference) if generation_input == "description" else None
+    prompt = (
+        description_generation_prompt(query, reference, icon_description)
+        if icon_description
+        else generation_prompt(query, reference)
+    )
     model = query.get("generation_model", "gpt-image-2")
     size = query.get("generation_size", "1024x1024")
     quality = query.get("generation_quality", "medium")
     icon_id, label = semantic_icon(query)
     style = icon_style(query)
     chroma_hex = rgb_to_hex(reference.chroma_key)
-    prompt_version = icon_prompt_version(query)
+    prompt_version = icon_prompt_version(query, generation_input)
+    force_regenerate = regeneration_requested(query)
+    regen_metadata = regeneration_metadata(query)
     cache_key = hashlib.sha256(
         json.dumps(
             {
@@ -892,7 +1093,10 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
                 "style": style,
                 "reference_hash": reference.image_hash,
                 "reference_palette": reference.palette,
+                "generation_input": generation_input,
+                "icon_description": icon_description,
                 "renderer_draws_container": bool_value(query.get("renderer_draws_container", False)),
+                "regeneration_guidance": regeneration_guidance(query),
                 "prompt_version": prompt_version,
                 "prompt": prompt,
             },
@@ -900,14 +1104,19 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
         ).encode("utf-8")
     ).hexdigest()[:24]
     library_dir, library_path, manifest_path = generated_library_paths(icon_id, reference.image_hash, prompt_version)
-    if library_path.exists():
+    if library_path.exists() and not force_regenerate:
         shutil.copyfile(library_path, final_path)
-        padding_metrics = normalize_transparent_padding(final_path)
+        make_chroma_key_transparent(final_path, reference.chroma_key)
+        padding_metrics = normalize_transparent_padding(
+            final_path,
+            target_coverage=icon_artwork_target_coverage(query),
+        )
         artwork_metrics = generated_icon_artwork_metrics(final_path, reference.chroma_key)
         artwork_metrics["padding_normalization"] = padding_metrics
         palette_check = validate_generated_palette(final_path, reference)
         artwork_metrics["palette_check"] = palette_check
         if palette_check["ok"]:
+            shutil.copyfile(final_path, library_path)
             return {
                 "path": relative_to_repo(final_path),
                 "bbox": None,
@@ -922,6 +1131,8 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
                 "source_reference_hash": reference.image_hash,
                 "source_reference_bbox": [int(value) for value in reference.bbox],
                 "source_reference_type": reference.source,
+                "generation_input": generation_input,
+                "icon_description": icon_description,
                 "renderer_draws_container": bool_value(query.get("renderer_draws_container", False)),
                 "container_bbox": query.get("container_bbox"),
                 "container_shape": query.get("container_shape"),
@@ -930,6 +1141,7 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
                 "cache_key": cache_key,
                 "generation_metrics": artwork_metrics,
                 "library_reused": True,
+                **regen_metadata,
             }
         print(
             "warning: cached generated icon introduced absent source color families; regenerating "
@@ -945,31 +1157,37 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
     if not IMAGE_GEN_CLI.exists():
         raise RuntimeError(f"Image generation CLI not found: {IMAGE_GEN_CLI}")
 
-    cmd = [
-        sys.executable,
-        str(IMAGE_GEN_CLI),
-        "edit",
-        "--model",
-        model,
-        "--image",
-        str(reference.path),
-        "--prompt",
-        prompt,
-        "--size",
-        size,
-        "--quality",
-        quality,
-        "--out",
-        str(raw_path),
-        "--force",
-    ]
+    cmd = [sys.executable, str(IMAGE_GEN_CLI)]
+    if generation_input == "description":
+        cmd.append("generate")
+    else:
+        cmd.extend(["edit", "--image", str(reference.path)])
+    cmd.extend(
+        [
+            "--model",
+            model,
+            "--prompt",
+            prompt,
+            "--size",
+            size,
+            "--quality",
+            quality,
+            "--out",
+            str(raw_path),
+            "--force",
+        ]
+    )
     last_palette_check: dict[str, Any] | None = None
     strategies = ["chroma"] * ICON_GENERATION_ATTEMPTS + ["source_matte"] * ICON_SOURCE_MATTE_ATTEMPTS
     background_mode = "chroma"
     for attempt, strategy in enumerate(strategies, start=1):
         source_matte = strategy == "source_matte"
         background_mode = strategy
-        attempt_prompt = generation_prompt(query, reference, source_matte=source_matte)
+        attempt_prompt = (
+            description_generation_prompt(query, reference, icon_description, source_matte=source_matte)
+            if icon_description
+            else generation_prompt(query, reference, source_matte=source_matte)
+        )
         if last_palette_check and last_palette_check.get("violations"):
             attempt_prompt = (
                 attempt_prompt
@@ -982,7 +1200,10 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
         raw_path.replace(final_path)
         if not source_matte:
             make_chroma_key_transparent(final_path, reference.chroma_key)
-        padding_metrics = normalize_transparent_padding(final_path)
+        padding_metrics = normalize_transparent_padding(
+            final_path,
+            target_coverage=icon_artwork_target_coverage(query),
+        )
         artwork_metrics = generated_icon_artwork_metrics(final_path, reference.chroma_key)
         artwork_metrics["padding_normalization"] = padding_metrics
         artwork_metrics["background_mode"] = background_mode
@@ -1012,9 +1233,12 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
                 "source_reference_bbox": [int(value) for value in reference.bbox],
                 "source_reference_type": reference.source,
                 "source_palette": reference.palette,
+                "generation_input": generation_input,
+                "icon_description": icon_description,
                 "renderer_draws_container": bool_value(query.get("renderer_draws_container", False)),
                 "container_bbox": query.get("container_bbox"),
                 "container_shape": query.get("container_shape"),
+                "regeneration_guidance": regeneration_guidance(query),
                 "chroma_key": chroma_hex,
                 "background_mode": background_mode,
                 "generation_metrics": artwork_metrics,
@@ -1040,6 +1264,8 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
         "source_reference_bbox": [int(value) for value in reference.bbox],
         "source_reference_type": reference.source,
         "source_palette": reference.palette,
+        "generation_input": generation_input,
+        "icon_description": icon_description,
         "renderer_draws_container": bool_value(query.get("renderer_draws_container", False)),
         "container_bbox": query.get("container_bbox"),
         "container_shape": query.get("container_shape"),
@@ -1048,7 +1274,68 @@ def generate_asset(query: dict, out_dir: Path, reference: SourceReference) -> di
         "generation_metrics": artwork_metrics,
         "cache_key": cache_key,
         "library_reused": False,
+        **regen_metadata,
     }
+
+
+def refresh_generated_asset(
+    asset: dict,
+    query: dict,
+    path: Path,
+    reference: SourceReference,
+    *,
+    generation_input: str,
+) -> dict | None:
+    """Re-run deterministic cleanup/metrics on an existing generated asset."""
+    icon_id, label = semantic_icon(query)
+    style = icon_style(query)
+    prompt_version = icon_prompt_version(query, generation_input)
+    make_chroma_key_transparent(path, reference.chroma_key)
+    padding_metrics = normalize_transparent_padding(
+        path,
+        target_coverage=icon_artwork_target_coverage(query),
+    )
+    artwork_metrics = generated_icon_artwork_metrics(path, reference.chroma_key)
+    artwork_metrics["padding_normalization"] = padding_metrics
+    palette_check = validate_generated_palette(path, reference)
+    artwork_metrics["palette_check"] = palette_check
+    if not palette_check["ok"]:
+        print(
+            "warning: existing generated icon still introduced absent source color families; regenerating "
+            f"{query['name']}: {', '.join(palette_check['violations'])}",
+            file=sys.stderr,
+        )
+        return None
+
+    _, library_path, _ = generated_library_paths(icon_id, reference.image_hash, prompt_version)
+    library_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(path, library_path)
+    refreshed = dict(asset)
+    refreshed.update(
+        {
+            "path": relative_to_repo(path),
+            "bbox": None,
+            "anchor_text": query.get("anchor_text"),
+            "source": "generated_icon_library",
+            "icon_id": icon_id,
+            "icon_style": style,
+            "semantic_label": label,
+            "prompt_version": prompt_version,
+            "source_reference": relative_to_repo(reference.path),
+            "source_reference_hash": reference.image_hash,
+            "source_reference_bbox": [int(value) for value in reference.bbox],
+            "source_reference_type": reference.source,
+            "source_palette": reference.palette,
+            "generation_input": generation_input,
+            "renderer_draws_container": bool_value(query.get("renderer_draws_container", False)),
+            "container_bbox": query.get("container_bbox"),
+            "container_shape": query.get("container_shape"),
+            "chroma_key": rgb_to_hex(reference.chroma_key),
+            "generation_metrics": artwork_metrics,
+            "library_reused": True,
+        }
+    )
+    return refreshed
 
 
 def main() -> None:
@@ -1064,6 +1351,17 @@ def main() -> None:
             "auto/generate: require generated-library output for generatable icons. "
             "extract: crop only non-generatable raster assets; generatable icons fail."
         ),
+    )
+    parser.add_argument(
+        "--icon-generation-input",
+        choices=["source", "description"],
+        default=DEFAULT_ICON_GENERATION_INPUT,
+        help="description: describe source crop first, then generate from text; source: edit from source crop",
+    )
+    parser.add_argument(
+        "--only-assets",
+        default=None,
+        help="comma-separated asset names to process; other existing assets are left unchanged",
     )
     parser.add_argument("--update-spec", action="store_true")
     args = parser.parse_args()
@@ -1084,21 +1382,65 @@ def main() -> None:
     ocr_boxes = None
 
     assets = dict(spec.get("assets", {})) if isinstance(spec.get("assets"), dict) else {}
+    only_assets = {item.strip() for item in args.only_assets.split(",") if item.strip()} if args.only_assets else None
     manifest = {"source_size": [int(img.shape[1]), int(img.shape[0])], "assets": {}}
     for query in queries:
         name = query["name"]
+        if only_assets is not None and name not in only_assets:
+            if name in assets:
+                manifest["assets"][name] = assets[name]
+            continue
         is_generatable = bool_value(query.get("generatable", False))
+        force_regenerate = is_generatable and regeneration_requested(query)
         existing_asset = assets.get(name, {})
         existing_path = existing_asset_path(existing_asset)
-        if existing_path is not None:
-            if is_generatable and existing_asset.get("source") != "generated_icon_library":
+        if force_regenerate:
+            assets.pop(name, None)
+            print(f"{name}: refinement requested regeneration")
+        elif existing_path is not None:
+            existing_generation_input = existing_asset.get("generation_input") or "source"
+            expected_prompt_version = icon_prompt_version(query, args.icon_generation_input)
+            existing_prompt_version = existing_asset.get("prompt_version")
+            if is_generatable and (
+                existing_asset.get("source") != "generated_icon_library"
+                or existing_generation_input != args.icon_generation_input
+                or existing_prompt_version != expected_prompt_version
+            ):
                 print(
-                    f"warning: ignoring non-generated existing asset for final-quality icon {name}: "
-                    f"{existing_asset.get('source')}",
+                    f"warning: ignoring existing asset for final-quality icon {name}: "
+                    f"source={existing_asset.get('source')} "
+                    f"generation_input={existing_generation_input} "
+                    f"prompt_version={existing_prompt_version}",
                     file=sys.stderr,
                 )
                 assets.pop(name, None)
             else:
+                if is_generatable:
+                    reference = source_reference_for_query(query, out_dir, image_path, img)
+                    if reference is None:
+                        raise RuntimeError(f"source reference crop is required to refresh generated icon {name}")
+                    refreshed_asset = refresh_generated_asset(
+                        existing_asset,
+                        query,
+                        existing_path,
+                        reference,
+                        generation_input=args.icon_generation_input,
+                    )
+                    if refreshed_asset is not None:
+                        assets[name] = refreshed_asset
+                        manifest["assets"][name] = refreshed_asset
+                        print(f"{name}: refreshed {existing_path}")
+                        continue
+                    assets.pop(name, None)
+                    existing_path.unlink(missing_ok=True)
+                else:
+                    manifest["assets"][name] = assets[name]
+                    print(f"{name}: reused {existing_path}")
+                    continue
+
+        if name in assets and not is_generatable:
+            existing_path = existing_asset_path(assets[name])
+            if existing_path is not None:
                 manifest["assets"][name] = assets[name]
                 print(f"{name}: reused {existing_path}")
                 continue
@@ -1109,10 +1451,12 @@ def main() -> None:
             reference = source_reference_for_query(query, out_dir, image_path, img)
             if reference is None:
                 raise RuntimeError(f"source reference crop is required to generate final-quality icon {name}")
-            asset = generate_asset(query, out_dir, reference)
+            asset = generate_asset(query, out_dir, reference, generation_input=args.icon_generation_input)
             assets[name] = asset
             manifest["assets"][name] = assets[name]
-            action = "reused generated icon" if asset.get("library_reused") else "generated"
+            if force_regenerate:
+                clear_regeneration_request(spec, name)
+            action = "regenerated" if force_regenerate else "reused generated icon" if asset.get("library_reused") else "generated"
             print(f"{name}: {action}")
             continue
 

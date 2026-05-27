@@ -7,11 +7,16 @@ The project is intentionally spec-driven:
 1. Read a source image.
 2. Use Apple Vision OCR on macOS to collect text and bounding boxes.
 3. Send the source image plus OCR context to an OpenAI vision model to draft a JSON slide spec.
-4. Extract real source logos/assets from OCR anchors.
-5. Generate or reuse canonical generic, text-free pictograms when allowed.
-6. Render editable `.pptx` files with native text, shapes, connectors, and images.
-7. Optionally run render-preview-refine loops that critique the PPTX screenshot
+4. Run a constrained source/spec structural QA pass for missing lines, simple
+   shapes, and connectors.
+5. Extract real source logos/assets from OCR anchors.
+6. Generate or reuse canonical generic, text-free pictograms when allowed.
+7. Render editable `.pptx` files with native text, shapes, connectors, and images.
+8. Optionally run render-preview-refine loops that critique the PPTX screenshot
    and patch layout issues.
+9. Run one bounded post-render structural QA pass when visual QA was enabled,
+   so missing or shortened lines/connectors can be patched after seeing the
+   rendered preview.
 
 The source image is treated as evidence, not as the slide background.
 
@@ -51,21 +56,9 @@ That lets one source image split into 2-4 readable output slides when a single
 editable slide would be cramped. The child slides still use `generic_slide`
 elements and share the same extracted/generated assets.
 
-There is also one specialized renderer:
-
-- `architecture_parallel_layers`
-
-This layout handles architecture diagrams with:
-
-- a left narrative/sidebar
-- top user/device row
-- horizontal stack/layer boxes
-- source-cropped vendor/app logos
-- a parallel platform/product layer
-- connector lines
-- a footer/callout
-
-More layouts can be added by creating a prompt file and renderer pair.
+Legacy layout-specific renderers have been removed from the active pipeline.
+Old specs such as `architecture_parallel_layers` are not supported; regenerate
+them as `generic_slide` or `generic_deck`.
 
 ## Repo Layout
 
@@ -74,12 +67,13 @@ slidegen/
 ├── prompts/
 │   ├── spec_generation/
 │   │   ├── system.md
-│   │   ├── generic_slide.md
-│   │   └── architecture_parallel_layers.md
+│   │   └── generic_slide.md
 │   └── refinement/
+│       ├── spec_structure.md
 │       └── visual_quality.md
 ├── src/
 │   ├── generate_spec_openai.py
+│   ├── refine_structure_openai.py
 │   ├── refine_spec_openai.py
 │   ├── render_preview.py
 │   ├── run_batch.py
@@ -89,7 +83,6 @@ slidegen/
 │   ├── extract_logos_vision.py
 │   ├── pptx_utils.py
 │   ├── render_generic.py
-│   ├── render_architecture.py
 │   └── verify_spec.py
 ├── requirements.txt
 └── README.md
@@ -106,7 +99,9 @@ For OpenAI-backed spec generation, create a local `.env` file:
 
 ```bash
 OPENAI_SPEC_MODEL=gpt-5.5
+OPENAI_STRUCTURE_MODEL=gpt-5.5
 OPENAI_REFINE_MODEL=gpt-5.5
+OPENAI_ICON_DESCRIBE_MODEL=gpt-5.5
 ```
 
 Set `OPENAI_API_KEY` in that local `.env` file. `.env` is ignored by git.
@@ -120,8 +115,6 @@ Set `OPENAI_API_KEY` in that local `.env` file. `.env` is ignored by git.
   images/source.png \
   specs/source.auto.json \
   output/source.pptx \
-  --generate-spec \
-  --force-spec \
   --spec-model gpt-5.5
 ```
 
@@ -137,18 +130,18 @@ and the OCR context says it was unavailable. Use `--no-ocr` on
 .venv/bin/python src/run_pipeline.py \
   images/source.png \
   specs/source.auto.json \
-  output/source.pptx \
-  --generate-spec \
-  --force-spec
+  output/source.pptx
 ```
 
 This will:
 
 1. Generate a JSON spec from the image and Apple Vision OCR context.
-2. Extract declared logo assets from the source image.
-3. Verify the generated spec and print non-fatal warnings.
-4. Render an editable `.pptx`.
-5. Run two preview/refinement iterations by default for visual-quality runs.
+2. Run one source/spec structural QA pass by default to catch material missing
+   connectors, lines, and simple shapes before asset extraction.
+3. Extract declared logo assets from the source image.
+4. Verify the generated spec and print non-fatal warnings.
+5. Render an editable `.pptx`.
+6. Run two preview/refinement iterations by default for visual-quality runs.
 
 The default `--spec-layout` is `generic_slide`. The model may emit a
 `generic_deck` when the source image is too dense for one readable slide.
@@ -161,17 +154,47 @@ refinement loop or set the desired iteration count explicitly:
   images/source.png \
   specs/source.auto.json \
   output/source.pptx \
-  --generate-spec \
-  --force-spec \
   --asset-mode generate \
   --refine 2
 ```
+
+To skip structural QA during a fast run, pass:
+
+```bash
+--spec-refine 0
+```
+
+Generic icon generation defaults to description mode:
+
+```bash
+--icon-generation-input description
+```
+
+That mode first asks the OpenAI model to describe the cropped source icon, then
+asks imagegen to create the icon from that description instead of editing the
+crop. This has generally produced cleaner icon backgrounds while still treating
+the source image as the visual authority. To force source-image edit mode, pass:
+
+```bash
+--icon-generation-input source
+```
+
+Source mode sends the cropped source icon to imagegen and asks it to recreate
+the same visual treatment directly from the crop.
 
 Each refinement iteration renders the PPTX, creates a Quick Look preview PNG,
 sends the source image, rendered preview, spec, and deterministic lint hints to
 OpenAI, then applies only validated JSON patch operations. The patch policy
 favors moving/resizing text boxes and grouped font scaling over one-off tiny
-font changes.
+font changes. The same refinement loop can also request a targeted
+`regenerate_icon` patch for generic icon artwork problems. When that happens,
+the pipeline removes the stale generated icon, passes the visual-QA guidance
+back into icon generation, reruns only the affected assets, and renders the
+next preview from the updated spec. Visual refinement can also add or adjust
+simple connector lines when the screenshot reveals a structural miss that was
+not caught before rendering. After visual QA, the pipeline runs one additional
+structural pass against the rendered preview when `--spec-refine` is enabled;
+that pass is limited to line and simple-shape operations.
 
 Optional style helpers can be passed during spec generation:
 
@@ -180,8 +203,6 @@ Optional style helpers can be passed during spec generation:
   images/source.png \
   specs/source.auto.json \
   output/source.pptx \
-  --generate-spec \
-  --force-spec \
   --style-guide-image path/to/brand-style-guide.png \
   --template-pptx path/to/template-deck.pptx
 ```
@@ -190,20 +211,19 @@ Helper images are reference-only. The source slide remains the authority for
 copy and meaning; style guides and template previews can influence palette,
 typography, spacing, card treatments, and icon treatment.
 
-Use `--scratch-dir` for repeatable test runs that should not leave intermediate
-specs, extracted assets, or generated icon cache files in the repo. Final PPTX
-files and rendered PNG previews remain in `--output-dir`.
+`run_pipeline.py` always regenerates and overwrites the spec path. Treat that
+spec path as an output artifact, not an input dependency.
 
 To rerender an existing spec without rerunning OCR or OpenAI calls:
 
 ```bash
-.venv/bin/python src/run_pipeline.py \
-  images/source.png \
-  specs/source.auto.json \
-  output/source.pptx \
-  --skip-assets \
-  --refine 0
+.venv/bin/python src/render_generic.py specs/source.auto.json output/source.pptx
 ```
+
+For clean-checkout-style testing, do not reuse repo-local specs, extracted
+assets, or generated icon caches. Use `run_batch.py` with a fresh scratch
+directory; it deletes that scratch directory at the start of the run unless
+`--keep-scratch` is supplied.
 
 ## Full Deck Batch Flow
 
@@ -216,7 +236,6 @@ deck:
   --spec-dir specs/auto \
   --output-dir output/auto \
   --combined output/all_slides_auto.pptx \
-  --force-spec \
   --refine 2
 ```
 
@@ -228,8 +247,17 @@ shapes. Do not use that mode for final visual-quality review.
 Useful narrower runs:
 
 ```bash
-.venv/bin/python src/run_batch.py --start 23 --end 25 --force-spec
-.venv/bin/python src/run_batch.py --limit 3 --force-spec
+.venv/bin/python src/run_batch.py \
+  --start 23 \
+  --end 25 \
+  --scratch-dir /private/tmp/slidegen_clean_e2e \
+  --output-dir output/clean_e2e \
+  --combined output/clean_e2e/slides_23_25.pptx
+.venv/bin/python src/run_batch.py \
+  --limit 3 \
+  --scratch-dir /private/tmp/slidegen_clean_e2e \
+  --output-dir output/clean_e2e \
+  --combined output/clean_e2e/first_3.pptx
 .venv/bin/python src/run_batch.py \
   --slides 1,26-28 \
   --output-dir output/helper_tests \
@@ -248,7 +276,7 @@ Prompts are versioned repo artifacts:
 
 - `prompts/spec_generation/system.md`
 - `prompts/spec_generation/generic_slide.md`
-- `prompts/spec_generation/architecture_parallel_layers.md`
+- `prompts/refinement/spec_structure.md`
 - `prompts/refinement/visual_quality.md`
 
 The prompt contract is deliberately strict:
@@ -258,6 +286,8 @@ The prompt contract is deliberately strict:
 - do not recreate real logos with image generation
 - do not generate slide text as raster art
 - emit a JSON spec that deterministic renderers can consume
+- refine the fresh spec with constrained structural patches for material
+  missing lines, connectors, and simple shapes
 - refine rendered PPTX previews with constrained JSON patches, not full
   free-form rewrites
 
@@ -276,6 +306,15 @@ Use this order:
    background contaminates the artwork, the asset step retries and may keep a
    source-matched matte when that better preserves the original visual
    treatment.
+   The refinement loop can request targeted icon regeneration when the preview
+   shows a wrong subject, weak source match, unwanted matte/crop artifact, or
+   inconsistent icon treatment. This is still source-image driven: guidance
+   explains what to fix, while the source reference crop and inferred palette
+   remain the visual authority.
+   The default generation input is `description`: the asset step describes the
+   source crop with an OpenAI vision model and then generates from that
+   description. The explicit `source` input remains available for A/B checks
+   where direct image editing is preferred.
 4. Generic pictograms must not use source crops as final rendered assets. If a
    generated icon cannot be produced, the final-quality run fails before the
    renderer can substitute a native placeholder.

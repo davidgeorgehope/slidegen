@@ -10,6 +10,10 @@ Find only issues that materially reduce slide quality:
 - repeated peer elements with inconsistent font sizes
 - repeated cards, chips, rows, or labels that are visibly misaligned
 - generic icon artwork that is too small or too large inside its badge/container
+- generated generic icon artwork with the wrong subject, wrong visual treatment,
+  visible matte/crop artifacts, or obviously weaker source match
+- missing or visibly shortened structural lines, connectors, dividers, arrows,
+  or simple background shapes that matter to the diagram
 - important content that drifted far from its source position
 
 Do not chase tiny pixel differences. Do not redesign the slide. Preserve the
@@ -29,5 +33,18 @@ Patch policy:
 - You may resize generic icon bboxes when the rendered icon is visibly wrong
   relative to the source badge/container. Keep the icon centered and consistent
   with peer icons.
+- Use `regenerate_icon` for generic icon artwork quality problems that cannot
+  be solved by resizing the bbox: wrong subject, wrong colors, weak/faint
+  artwork, unwanted crop/matte background, or inconsistent style versus the
+  source. Target the icon element path or asset name, and include concise
+  `guidance` describing what the regenerated asset should fix. Do not use this
+  for brand marks, vendor logos, product logos, or screenshots.
+- Use `set_line_points` when a line/connector exists in the spec but is too
+  short, too long, or attached to the wrong source-image coordinates.
+- Use `add_line` only for a clearly visible, material source connector/divider
+  that is absent from the current spec. Match source color, dash, arrowhead,
+  and z-order. Do not add decorative micro-lines.
+- Use `add_shape` only for a clearly missing simple source panel, badge,
+  background band, or divider shape. Do not add text or complex artwork.
 
 Return only JSON. The caller will validate and reject unsafe operations.

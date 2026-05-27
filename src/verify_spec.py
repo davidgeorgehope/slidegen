@@ -62,6 +62,9 @@ def generic_asset_refs(spec):
 
 def verify(spec: dict) -> list[str]:
     warnings = []
+    if spec.get("layout") not in {"generic_slide", "generic_deck"}:
+        warnings.append(f"unsupported legacy layout `{spec.get('layout')}`; regenerate as generic_slide/generic_deck")
+
     declared = {item.get("name") for item in spec.get("logo_assets", []) if isinstance(item, dict)}
     declared_assets = {item.get("name") for item in spec.get("asset_queries", []) if isinstance(item, dict)}
     assets = spec.get("assets", {})
