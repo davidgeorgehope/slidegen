@@ -182,6 +182,11 @@ the source image as the visual authority. To force source-image edit mode, pass:
 Source mode sends the cropped source icon to imagegen and asks it to recreate
 the same visual treatment directly from the crop.
 
+If the description model returns empty text after retries for a specific icon,
+the asset step automatically uses source-image generation for that icon. This
+still produces a generated icon asset; it does not allow source crops to appear
+as final generic icons.
+
 Each refinement iteration renders the PPTX, creates a Quick Look preview PNG,
 sends the source image, rendered preview, spec, and deterministic lint hints to
 OpenAI, then applies only validated JSON patch operations. The patch policy
@@ -224,6 +229,14 @@ For clean-checkout-style testing, do not reuse repo-local specs, extracted
 assets, or generated icon caches. Use `run_batch.py` with a fresh scratch
 directory; it deletes that scratch directory at the start of the run unless
 `--keep-scratch` is supplied.
+
+If a long batch run is interrupted, rerun with `--resume` before deleting the
+scratch directory. Resume mode preserves the scratch directory and skips slides
+that already have both a generated spec and PPTX output:
+
+```bash
+./complete_slide_deck.sh --resume
+```
 
 ## Full Deck Batch Flow
 

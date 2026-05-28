@@ -184,13 +184,20 @@ def main() -> None:
     parser.add_argument("--no-verify", action="store_true")
     parser.add_argument("--no-combined", action="store_true")
     parser.add_argument("--no-previews", action="store_true", help="skip final PNG previews beside output PPTX files")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip slide images that already have both a generated spec and PPTX output",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     scratch_dir = Path(args.scratch_dir) if args.scratch_dir else None
     if scratch_dir:
         scratch_dir = scratch_dir.resolve()
-        if not args.keep_scratch and not args.dry_run:
+        if args.resume and not args.keep_scratch:
+            print(f"resume requested; preserving scratch directory: {scratch_dir}", flush=True)
+        if not args.keep_scratch and not args.dry_run and not args.resume:
             shutil.rmtree(scratch_dir, ignore_errors=True)
         args.extract_root = str(scratch_dir / "extracted")
         args.icon_library_dir = str(scratch_dir / "icon_library")
@@ -228,18 +235,25 @@ def main() -> None:
         spec_path = spec_dir / f"{image_path.stem}.json"
         out_path = output_dir / f"{image_path.stem}.pptx"
         print(f"\n[{idx}/{len(images)}] {image_path.name}", flush=True)
-        run(pipeline_cmd(args, image_path, spec_path, out_path), env, args.dry_run)
+        if args.resume and spec_path.exists() and out_path.exists():
+            print(f"resume: using existing {spec_path} and {out_path}", flush=True)
+        else:
+            run(pipeline_cmd(args, image_path, spec_path, out_path), env, args.dry_run)
         spec_paths.append(spec_path)
         out_paths.append(out_path)
         if not args.no_previews:
-            run(render_preview_cmd(out_path, out_path.with_suffix(".png")), env, args.dry_run)
+            preview_path = out_path.with_suffix(".png")
+            if args.resume and preview_path.exists():
+                print(f"resume: using existing preview {preview_path}", flush=True)
+            else:
+                run(render_preview_cmd(out_path, preview_path), env, args.dry_run)
 
     if not args.no_combined and not args.dry_run:
         combine_specs(spec_paths, combined_path)
         if not args.no_previews:
             run(render_preview_cmd(combined_path, combined_path.with_suffix(".png")), env, args.dry_run)
 
-    if scratch_dir and not args.keep_scratch and not args.dry_run:
+    if scratch_dir and not args.keep_scratch and not args.dry_run and not args.resume:
         shutil.rmtree(scratch_dir, ignore_errors=True)
 
 

@@ -1072,7 +1072,21 @@ def generate_asset(
 ) -> dict | None:
     raw_path = out_dir / f"{safe_name(query['name'])}_generated_raw.png"
     final_path = out_dir / f"{safe_name(query['name'])}.png"
-    icon_description = describe_icon_reference(query, reference) if generation_input == "description" else None
+    requested_generation_input = generation_input
+    effective_generation_input = generation_input
+    icon_description = None
+    description_fallback_reason = None
+    if generation_input == "description":
+        try:
+            icon_description = describe_icon_reference(query, reference)
+        except RuntimeError as exc:
+            description_fallback_reason = str(exc)
+            effective_generation_input = "source"
+            print(
+                "warning: icon description failed; using source-grounded generation for "
+                f"{query['name']}: {description_fallback_reason}",
+                file=sys.stderr,
+            )
     prompt = (
         description_generation_prompt(query, reference, icon_description)
         if icon_description
@@ -1084,9 +1098,16 @@ def generate_asset(
     icon_id, label = semantic_icon(query)
     style = icon_style(query)
     chroma_hex = rgb_to_hex(reference.chroma_key)
-    prompt_version = icon_prompt_version(query, generation_input)
+    prompt_version = icon_prompt_version(query, effective_generation_input)
     force_regenerate = regeneration_requested(query)
     regen_metadata = regeneration_metadata(query)
+    input_metadata = {
+        "generation_input": effective_generation_input,
+    }
+    if effective_generation_input != requested_generation_input:
+        input_metadata["requested_generation_input"] = requested_generation_input
+    if description_fallback_reason:
+        input_metadata["description_fallback_reason"] = description_fallback_reason
     cache_key = hashlib.sha256(
         json.dumps(
             {
@@ -1097,7 +1118,9 @@ def generate_asset(
                 "style": style,
                 "reference_hash": reference.image_hash,
                 "reference_palette": reference.palette,
-                "generation_input": generation_input,
+                "generation_input": effective_generation_input,
+                "requested_generation_input": requested_generation_input,
+                "description_fallback_reason": description_fallback_reason,
                 "icon_description": icon_description,
                 "renderer_draws_container": bool_value(query.get("renderer_draws_container", False)),
                 "regeneration_guidance": regeneration_guidance(query),
@@ -1141,7 +1164,6 @@ def generate_asset(
                 "source_reference_hash": reference.image_hash,
                 "source_reference_bbox": [int(value) for value in reference.bbox],
                 "source_reference_type": reference.source,
-                "generation_input": generation_input,
                 "icon_description": icon_description,
                 "renderer_draws_container": bool_value(query.get("renderer_draws_container", False)),
                 "container_bbox": query.get("container_bbox"),
@@ -1151,6 +1173,7 @@ def generate_asset(
                 "cache_key": cache_key,
                 "generation_metrics": artwork_metrics,
                 "library_reused": True,
+                **input_metadata,
                 **regen_metadata,
             }
         print(
@@ -1168,7 +1191,7 @@ def generate_asset(
         raise RuntimeError(f"Image generation CLI not found: {IMAGE_GEN_CLI}")
 
     cmd = [sys.executable, str(IMAGE_GEN_CLI)]
-    if generation_input == "description":
+    if effective_generation_input == "description":
         cmd.append("generate")
     else:
         cmd.extend(["edit", "--image", str(reference.path)])
@@ -1251,8 +1274,8 @@ def generate_asset(
                 "source_reference_bbox": [int(value) for value in reference.bbox],
                 "source_reference_type": reference.source,
                 "source_palette": reference.palette,
-                "generation_input": generation_input,
                 "icon_description": icon_description,
+                **input_metadata,
                 "renderer_draws_container": bool_value(query.get("renderer_draws_container", False)),
                 "container_bbox": query.get("container_bbox"),
                 "container_shape": query.get("container_shape"),
@@ -1282,8 +1305,8 @@ def generate_asset(
         "source_reference_bbox": [int(value) for value in reference.bbox],
         "source_reference_type": reference.source,
         "source_palette": reference.palette,
-        "generation_input": generation_input,
         "icon_description": icon_description,
+        **input_metadata,
         "renderer_draws_container": bool_value(query.get("renderer_draws_container", False)),
         "container_bbox": query.get("container_bbox"),
         "container_shape": query.get("container_shape"),

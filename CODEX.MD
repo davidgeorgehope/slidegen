@@ -110,7 +110,9 @@ OpenAI implementation:
 
 - Current imagegen CLI path.
 - Explicit `gpt-image-2`.
-- Supports current `description` and `source` icon-generation modes.
+- Supports current `description` and `source` icon-generation modes. If an
+  icon-description call returns empty text after retries, that icon may use the
+  source-grounded generation path instead of stopping the deck run.
 - Keeps existing chroma-key cleanup, padding normalization, palette checks,
   library caching, and regeneration loop.
 
