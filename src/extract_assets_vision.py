@@ -183,6 +183,10 @@ def regeneration_metadata(query: dict) -> dict[str, Any]:
     return metadata
 
 
+def strict_icon_palette() -> bool:
+    return bool_value(os.getenv("SLIDEGEN_STRICT_ICON_PALETTE"))
+
+
 def clear_regeneration_request(spec: dict, name: str) -> None:
     for query in spec.get("asset_queries", []):
         if not isinstance(query, dict):
@@ -1115,7 +1119,13 @@ def generate_asset(
         artwork_metrics["padding_normalization"] = padding_metrics
         palette_check = validate_generated_palette(final_path, reference)
         artwork_metrics["palette_check"] = palette_check
-        if palette_check["ok"]:
+        if not palette_check["ok"] and not strict_icon_palette():
+            print(
+                "warning: cached generated icon introduced absent source color families; accepting "
+                f"{query['name']}: {', '.join(palette_check['violations'])}",
+                file=sys.stderr,
+            )
+        if palette_check["ok"] or not strict_icon_palette():
             shutil.copyfile(final_path, library_path)
             return {
                 "path": relative_to_repo(final_path),
@@ -1212,11 +1222,19 @@ def generate_asset(
         if palette_check["ok"]:
             break
         last_palette_check = palette_check
-        final_path.unlink(missing_ok=True)
         if attempt == len(strategies):
-            raise RuntimeError(
-                f"generated icon introduced absent source color families: {', '.join(palette_check['violations'])}"
+            if strict_icon_palette():
+                final_path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"generated icon introduced absent source color families: {', '.join(palette_check['violations'])}"
+                )
+            print(
+                "warning: generated icon introduced absent source color families after retries; accepting "
+                f"{query['name']}: {', '.join(palette_check['violations'])}",
+                file=sys.stderr,
             )
+            break
+        final_path.unlink(missing_ok=True)
     library_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(final_path, library_path)
     manifest_path.write_text(

@@ -187,7 +187,9 @@ Every provider must pass the same pipeline checks:
 - No missing referenced assets.
 - No cropped generic icons in final-quality output.
 - Generated icon file exists and is a valid image.
-- Generated icon passes padding, palette, and basic artwork coverage checks.
+- Generated icon passes padding and basic artwork coverage checks.
+- Palette mismatches are recorded and warned by default after retries; they are
+  fatal only when `SLIDEGEN_STRICT_ICON_PALETTE=1`.
 - Rendered PPTX preview is created.
 - Visual refinement loop can still request icon regeneration.
 - Structural refinement can still add or adjust missing lines/shapes.

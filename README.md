@@ -305,7 +305,10 @@ Use this order:
    The source crop also drives palette constraints. If an artificial chroma
    background contaminates the artwork, the asset step retries and may keep a
    source-matched matte when that better preserves the original visual
-   treatment.
+   treatment. Palette mismatches are warnings by default after retries so a
+   single generated icon does not stop a full-deck run; set
+   `SLIDEGEN_STRICT_ICON_PALETTE=1` to make those mismatches fatal during
+   debugging.
    The refinement loop can request targeted icon regeneration when the preview
    shows a wrong subject, weak source match, unwanted matte/crop artifact, or
    inconsistent icon treatment. This is still source-image driven: guidance
