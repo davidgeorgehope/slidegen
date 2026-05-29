@@ -19,6 +19,9 @@ SPEC_MODEL="${SPEC_MODEL:-gpt-5.5}"
 REFINE_MODEL="${REFINE_MODEL:-gpt-5.5}"
 STYLE_GUIDE_IMAGE="${STYLE_GUIDE_IMAGE:-New Brand Mini Style Guide (1).png}"
 TEMPLATE_PPTX="${TEMPLATE_PPTX:-Copy of Obsidian Template Deck 2026.pptx}"
+COMPACT_FOR_GOOGLE="${COMPACT_FOR_GOOGLE:-1}"
+GOOGLE_COMBINED="${GOOGLE_COMBINED:-${COMBINED%.pptx}.google.pptx}"
+GOOGLE_MAX_EDGE="${GOOGLE_MAX_EDGE:-384}"
 
 if [[ ! -x "$PYTHON" ]]; then
   echo "Python not found or not executable: $PYTHON" >&2
@@ -95,4 +98,8 @@ if [[ "$dry_run" == true ]]; then
   echo "Dry run complete. No deck was written."
 else
   echo "Complete deck written to: $COMBINED"
+  if [[ "$COMPACT_FOR_GOOGLE" == "1" && -f "$COMBINED" ]]; then
+    "$PYTHON" "src/compact_pptx.py" "$COMBINED" "$GOOGLE_COMBINED" --max-edge "$GOOGLE_MAX_EDGE"
+    echo "Google-friendly deck written to: $GOOGLE_COMBINED"
+  fi
 fi

@@ -248,6 +248,19 @@ partial spec is missing assets, that slide is rerun before the combined deck is
 created. PNG previews are convenience artifacts; preview rendering failures do
 not fail the batch once the PPTX has been written.
 
+`complete_slide_deck.sh` also writes a compact Google-friendly copy beside the
+full output deck:
+
+```text
+output/complete_slide_deck/complete_slide_deck.google.pptx
+```
+
+This uses `src/compact_pptx.py` to downsample embedded images under
+`ppt/media/` while keeping the slide structure editable. Google Drive currently
+limits converted presentations to 100 MB, so the compact copy is the safer file
+to upload/import into Google Slides. Set `COMPACT_FOR_GOOGLE=0` to skip this
+extra copy, or adjust `GOOGLE_MAX_EDGE=512` for a less aggressive compact pass.
+
 ## Full Deck Batch Flow
 
 To run every `images/image*.png` through the pipeline and produce one combined
