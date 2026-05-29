@@ -131,6 +131,22 @@ def bbox_intersects(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) 
     return ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah
 
 
+def crop_logo_asset(
+    img,
+    out_path: Path,
+    bbox: tuple[int, int, int, int],
+    *,
+    remove_colored_background: bool = False,
+) -> tuple[int, int, int, int]:
+    x, y, w, h = bbox
+    crop = img[y:y + h, x:x + w]
+    cv2.imwrite(str(out_path), crop)
+    make_background_transparent(out_path)
+    if remove_colored_background:
+        remove_colored_edge_background(out_path)
+    return int(x), int(y), int(w), int(h)
+
+
 def segmented_text_bbox(target: str, group: list[OCRBox], text_bbox: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
     """Narrow a wide OCR box when Vision merged multiple adjacent logos."""
     if len(group) != 1:
@@ -231,23 +247,37 @@ def main() -> None:
     for item in spec.get("logo_assets", []):
         name = item["name"]
         target = item.get("match", name)
+        hint = bbox_hints.get(name)
         group, score = match_vendor(target, boxes, set())
+        out_path = out_dir / f"{safe_name(name)}.png"
         if not group:
-            print(f"WARN no match for {name} ({target}), best={score:.3f}")
+            if hint is None:
+                print(f"WARN no match for {name} ({target}), best={score:.3f}")
+                continue
+            x, y, w, h = crop_logo_asset(img, out_path, clamp_bbox_to_hint(hint, hint, img))
+            entry = {
+                "path": relative_to_repo(out_path),
+                "bbox": [x, y, w, h],
+                "source": "bbox_hint_logo_crop",
+                "match": target,
+                "ocr_text": None,
+                "ocr_score": round(float(score), 3),
+            }
+            assets[name] = entry
+            manifest[name] = entry
+            print(f"{name}: bbox={[x, y, w, h]} match={target!r} source=bbox_hint_logo_crop")
             continue
         text_bbox = union_bbox([box.bbox for box in group])
         text_bbox = segmented_text_bbox(target, group, text_bbox)
         bbox = logo_bbox_from_text(img, text_bbox)
-        hint = bbox_hints.get(name)
         used_hint_fallback = hint is not None and not bbox_intersects(bbox, hint)
         bbox = clamp_bbox_to_hint(bbox, hint, img)
-        x, y, w, h = bbox
-        crop = img[y:y + h, x:x + w]
-        out_path = out_dir / f"{safe_name(name)}.png"
-        cv2.imwrite(str(out_path), crop)
-        make_background_transparent(out_path)
-        if used_hint_fallback:
-            remove_colored_edge_background(out_path)
+        x, y, w, h = crop_logo_asset(
+            img,
+            out_path,
+            bbox,
+            remove_colored_background=used_hint_fallback,
+        )
 
         entry = {
             "path": relative_to_repo(out_path),

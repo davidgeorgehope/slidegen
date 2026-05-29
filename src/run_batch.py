@@ -76,11 +76,16 @@ def parse_slide_numbers(value: str | None) -> set[int] | None:
     return numbers or None
 
 
-def run(cmd: list[str], env: dict[str, str], dry_run: bool) -> None:
+def run(cmd: list[str], env: dict[str, str], dry_run: bool, *, required: bool = True) -> None:
     print("+ " + " ".join(cmd), flush=True)
     if dry_run:
         return
-    subprocess.run(cmd, cwd=ROOT, env=env, check=True)
+    try:
+        subprocess.run(cmd, cwd=ROOT, env=env, check=True)
+    except subprocess.CalledProcessError:
+        if required:
+            raise
+        print("warning: optional command failed; continuing", flush=True)
 
 
 def pipeline_cmd(args, image_path: Path, spec_path: Path, out_path: Path) -> list[str]:
@@ -299,6 +304,16 @@ def main() -> None:
                 for item in missing:
                     print(f"- {item}", flush=True)
             run(pipeline_cmd(args, image_path, spec_path, out_path), env, args.dry_run)
+            if not args.dry_run:
+                missing_after = missing_required_assets(
+                    spec_path,
+                    allow_native_icon_placeholders=args.skip_generic_assets,
+                )
+                if missing_after:
+                    raise RuntimeError(
+                        "Slide pipeline completed but required assets are still incomplete:\n"
+                        + "\n".join(missing_after)
+                    )
         spec_paths.append(spec_path)
         out_paths.append(out_path)
         if not args.no_previews:
@@ -306,7 +321,7 @@ def main() -> None:
             if args.resume and preview_path.exists():
                 print(f"resume: using existing preview {preview_path}", flush=True)
             else:
-                run(render_preview_cmd(out_path, preview_path), env, args.dry_run)
+                run(render_preview_cmd(out_path, preview_path), env, args.dry_run, required=False)
 
     if not args.no_combined and not args.dry_run:
         if args.skip_generic_assets:
@@ -317,7 +332,7 @@ def main() -> None:
             allow_native_icon_placeholders=args.skip_generic_assets,
         )
         if not args.no_previews:
-            run(render_preview_cmd(combined_path, combined_path.with_suffix(".png")), env, args.dry_run)
+            run(render_preview_cmd(combined_path, combined_path.with_suffix(".png")), env, args.dry_run, required=False)
 
     if scratch_dir and not args.keep_scratch and not args.dry_run and not args.resume:
         shutil.rmtree(scratch_dir, ignore_errors=True)

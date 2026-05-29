@@ -155,6 +155,36 @@ def bool_value(value) -> bool:
     return bool(value)
 
 
+def hex_rgb(value: Any) -> tuple[int, int, int] | None:
+    text = str(value or "").strip().lstrip("#")
+    if len(text) != 6:
+        return None
+    try:
+        return int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16)
+    except ValueError:
+        return None
+
+
+def dark_icon_background(value: Any) -> bool:
+    rgb = hex_rgb(value)
+    if rgb is None:
+        return False
+    red, green, blue = rgb
+    luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    saturation = (max(rgb) - min(rgb)) / max(1, max(rgb))
+    return luminance < 115 and saturation > 0.35
+
+
+def white_on_dark_icon_hint(query: dict) -> bool:
+    text = " ".join(
+        str(query.get(key) or "")
+        for key in ("name", "icon_id", "icon_style", "semantic_label", "anchor_text")
+    ).lower()
+    if re.search(r"\b(green|red|orange|yellow|purple)\b", text):
+        return "_white" in str(query.get("name") or "").lower()
+    return "white" in text or "very light" in text
+
+
 def regeneration_requested(query: dict) -> bool:
     return bool_value(query.get("regenerate")) or bool_value(query.get("force_regenerate"))
 
@@ -784,10 +814,19 @@ def annotate_queries_with_render_context(spec: dict, queries: list[dict]) -> lis
         cx = ix + iw / 2
         cy = iy + ih / 2
         containing_shapes = []
+        background_shapes = []
+        should_detect_dark_background = white_on_dark_icon_hint(item)
         for shape in shapes:
             sx, sy, sw, sh = [float(value) for value in shape["bbox"]]
             if sw < iw * 1.15 or sh < ih * 1.15:
                 continue
+            if (
+                should_detect_dark_background
+                and sx <= cx <= sx + sw
+                and sy <= cy <= sy + sh
+                and dark_icon_background(shape.get("fill"))
+            ):
+                background_shapes.append((sw * sh, shape))
             if sw > iw * 2.4 or sh > ih * 2.4:
                 continue
             shape_cx = sx + sw / 2
@@ -801,6 +840,11 @@ def annotate_queries_with_render_context(spec: dict, queries: list[dict]) -> lis
             item["renderer_draws_container"] = True
             item["container_bbox"] = [int(round(value)) for value in container["bbox"]]
             item["container_shape"] = str(container.get("shape") or "shape")
+        if background_shapes:
+            _, background = min(background_shapes, key=lambda value: value[0])
+            item["renderer_draws_dark_background"] = True
+            item["dark_background_bbox"] = [int(round(value)) for value in background["bbox"]]
+            item["dark_background_fill"] = str(background.get("fill") or "")
         annotated.append(item)
     return annotated
 
@@ -913,6 +957,13 @@ def describe_icon_reference(query: dict, reference: SourceReference) -> str:
             "not artwork to reproduce. If a smaller centered colored disk or filled shape carries the pictogram "
             "inside the crop, describe it as part of the icon artwork because it is not the outer renderer-owned badge. "
         )
+    dark_background_context = ""
+    if bool_value(query.get("renderer_draws_dark_background", False)):
+        dark_background_context = (
+            "The slide renderer already draws the dark blue/navy band behind this icon. "
+            "Treat that dark band, footer, separator, or panel as context, not artwork. "
+            "Describe the visible foreground icon strokes/fills, which are expected to be white or very light. "
+        )
     prompt = (
         "Describe this small source icon for a separate image-generation model. "
         "Return one concise paragraph, no JSON. Describe only visible visual facts: subject, shapes, "
@@ -921,6 +972,7 @@ def describe_icon_reference(query: dict, reference: SourceReference) -> str:
         "and incidental matte as context, not icon artwork; describe background only when it is "
         "clearly a designed icon container. Do not infer brand logos or add text. "
         f"{container_context}"
+        f"{dark_background_context}"
         f"Canonical icon id: {icon_id}. Intended subject: {label}. "
         f"Observed spec style hint: {icon_style(query)}. "
         f"{regeneration_guidance_text(query)}"
@@ -967,6 +1019,15 @@ def generation_prompt(query: dict, reference: SourceReference, *, source_matte: 
             "shape when it is part of the original icon treatment. "
             "Scale the source-owned icon artwork so it fills the transparent canvas with balanced padding. "
         )
+    dark_background_guidance = ""
+    if bool_value(query.get("renderer_draws_dark_background", False)):
+        dark_background_guidance = (
+            "The editable slide renderer already draws the dark blue/navy background band "
+            f"({query.get('dark_background_fill', 'dark fill')} at {query.get('dark_background_bbox')}). "
+            "Do not include that dark band, footer, panel, page background, or crop edge in the asset. "
+            "Generate only the foreground icon artwork as white or very light strokes/fills on transparent output. "
+            "Do not turn this icon blue; it must remain high-contrast on the existing dark background. "
+        )
     return (
         "Recreate the pictogram/icon shown in the attached source crop as a clean reusable presentation asset. "
         f"Canonical icon id: {icon_id}. Subject: {label}. "
@@ -974,6 +1035,7 @@ def generation_prompt(query: dict, reference: SourceReference, *, source_matte: 
         f"{regeneration_guidance_text(query)}"
         f"{palette_prompt_text(reference.palette)}"
         f"{container_guidance}"
+        f"{dark_background_guidance}"
         "If no separate renderer-owned container is provided, preserve the source crop's visible icon container when it is part of the icon artwork. "
         "If the crop includes nearby labels, text, page background, crop edges, or noise, ignore those artifacts and keep only the icon artwork. "
         "Do not invent a different palette, design system, badge color, or icon style. "
@@ -1000,6 +1062,15 @@ def description_generation_prompt(
             "when it carries the icon's original visual treatment. "
             "Scale the source-owned icon artwork so it fills the transparent canvas with balanced padding. "
         )
+    dark_background_guidance = ""
+    if bool_value(query.get("renderer_draws_dark_background", False)):
+        dark_background_guidance = (
+            "The editable slide renderer already draws the dark blue/navy background band "
+            f"({query.get('dark_background_fill', 'dark fill')} at {query.get('dark_background_bbox')}). "
+            "Do not include that dark band, footer, panel, page background, or crop edge in the asset. "
+            "Create only the foreground icon artwork as white or very light strokes/fills on transparent output. "
+            "Do not turn this icon blue; it must remain high-contrast on the existing dark background. "
+        )
     preserve_guidance = (
         "Preserve the described visual treatment, colors, proportions, and visual density. "
         if bool_value(query.get("renderer_draws_container", False))
@@ -1012,6 +1083,7 @@ def description_generation_prompt(
         f"{regeneration_guidance_text(query)}"
         f"{palette_prompt_text(reference.palette)}"
         f"{container_guidance}"
+        f"{dark_background_guidance}"
         f"{preserve_guidance}"
         "Do not preserve square crop boundaries, page background, or incidental matte as artwork. "
         "Do not add readable words, letters, numbers, brand marks, logos, watermark, UI text, or shadow. "
@@ -1022,9 +1094,13 @@ def description_generation_prompt(
 def icon_prompt_version(query: dict, generation_input: str = DEFAULT_ICON_GENERATION_INPUT) -> str:
     if generation_input == "description":
         base = f"{DEFAULT_ICON_PROMPT_VERSION}_desc_{DESCRIPTION_ICON_PROMPT_VERSION}"
+        if bool_value(query.get("renderer_draws_dark_background", False)):
+            base = f"{base}_darkbg"
         if bool_value(query.get("renderer_draws_container", False)):
             return f"{base}_container"
         return base
+    if bool_value(query.get("renderer_draws_dark_background", False)):
+        return f"{CONTAINER_ICON_PROMPT_VERSION if bool_value(query.get('renderer_draws_container', False)) else DEFAULT_ICON_PROMPT_VERSION}_darkbg"
     if bool_value(query.get("renderer_draws_container", False)):
         return CONTAINER_ICON_PROMPT_VERSION
     return DEFAULT_ICON_PROMPT_VERSION

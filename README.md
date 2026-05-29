@@ -219,6 +219,11 @@ typography, spacing, card treatments, and icon treatment.
 `run_pipeline.py` always regenerates and overwrites the spec path. Treat that
 spec path as an output artifact, not an input dependency.
 
+Logo extraction uses OCR text anchors first. If OCR misses a small declared
+logo but the spec has an image bbox for that asset, the extractor crops from
+that source-position hint so the final combine step is not blocked by a missing
+logo asset.
+
 To rerender an existing spec without rerunning OCR or OpenAI calls:
 
 ```bash
@@ -237,6 +242,11 @@ that already have both a generated spec and PPTX output:
 ```bash
 ./complete_slide_deck.sh --resume
 ```
+
+Resume validates referenced image/icon assets before skipping a slide. If a
+partial spec is missing assets, that slide is rerun before the combined deck is
+created. PNG previews are convenience artifacts; preview rendering failures do
+not fail the batch once the PPTX has been written.
 
 ## Full Deck Batch Flow
 
@@ -331,6 +341,9 @@ Use this order:
    source crop with an OpenAI vision model and then generates from that
    description. The explicit `source` input remains available for A/B checks
    where direct image editing is preferred.
+   For inverse icons on dark blue/navy footer bars, the extractor now tells
+   image generation that the renderer already owns the dark background and that
+   the generated asset should contain only the white/light foreground icon.
 4. Generic pictograms must not use source crops as final rendered assets. If a
    generated icon cannot be produced, the final-quality run fails before the
    renderer can substitute a native placeholder.
