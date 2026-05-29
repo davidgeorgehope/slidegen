@@ -122,7 +122,53 @@ def pipeline_cmd(args, image_path: Path, spec_path: Path, out_path: Path) -> lis
     return cmd
 
 
-def combine_specs(spec_paths: list[Path], out_path: Path) -> None:
+def referenced_assets(spec: dict, *, allow_native_icon_placeholders: bool = False) -> list[tuple[str, str, str]]:
+    refs = []
+    for slide_spec in specs_from_root(spec):
+        slide_name = str(slide_spec.get("slide") or "slide")
+        for element in slide_spec.get("elements", []):
+            if not isinstance(element, dict):
+                continue
+            element_type = str(element.get("type") or "")
+            if element_type not in {"image", "icon"}:
+                continue
+            if element_type == "icon" and allow_native_icon_placeholders:
+                continue
+            asset_name = str(element.get("asset") or "").strip()
+            if asset_name:
+                refs.append((asset_name, slide_name, element_type))
+    return refs
+
+
+def asset_path(spec: dict, name: str) -> Path | None:
+    asset = spec.get("assets", {}).get(name) if isinstance(spec.get("assets"), dict) else None
+    if not isinstance(asset, dict) or not asset.get("path"):
+        return None
+    path = Path(str(asset["path"]))
+    if not path.is_absolute():
+        path = ROOT / path
+    return path if path.exists() else None
+
+
+def missing_required_assets(spec_path: Path, *, allow_native_icon_placeholders: bool = False) -> list[str]:
+    if not spec_path.exists():
+        return [f"{spec_path}: missing spec"]
+    try:
+        spec = json.loads(spec_path.read_text())
+    except json.JSONDecodeError as exc:
+        return [f"{spec_path}: invalid JSON ({exc})"]
+
+    missing = []
+    for name, slide_name, element_type in referenced_assets(
+        spec,
+        allow_native_icon_placeholders=allow_native_icon_placeholders,
+    ):
+        if asset_path(spec, name) is None:
+            missing.append(f"{spec_path}: {element_type} `{name}` on `{slide_name}` has no usable asset")
+    return list(dict.fromkeys(missing))
+
+
+def combine_specs(spec_paths: list[Path], out_path: Path, *, allow_native_icon_placeholders: bool = False) -> None:
     prs = Presentation()
     prs.slide_width = SLIDE_W
     prs.slide_height = SLIDE_H
@@ -130,6 +176,12 @@ def combine_specs(spec_paths: list[Path], out_path: Path) -> None:
     added = 0
     skipped = []
     for spec_path in spec_paths:
+        missing = missing_required_assets(
+            spec_path,
+            allow_native_icon_placeholders=allow_native_icon_placeholders,
+        )
+        if missing:
+            raise RuntimeError("Cannot combine deck with incomplete assets:\n" + "\n".join(missing))
         spec = json.loads(spec_path.read_text())
         if spec.get("layout") not in {"generic_slide", "generic_deck"}:
             skipped.append(spec_path)
@@ -235,9 +287,17 @@ def main() -> None:
         spec_path = spec_dir / f"{image_path.stem}.json"
         out_path = output_dir / f"{image_path.stem}.pptx"
         print(f"\n[{idx}/{len(images)}] {image_path.name}", flush=True)
-        if args.resume and spec_path.exists() and out_path.exists():
+        missing = missing_required_assets(
+            spec_path,
+            allow_native_icon_placeholders=args.skip_generic_assets,
+        ) if args.resume else []
+        if args.resume and spec_path.exists() and out_path.exists() and not missing:
             print(f"resume: using existing {spec_path} and {out_path}", flush=True)
         else:
+            if args.resume and missing:
+                print("resume: rerunning because required assets are incomplete:", flush=True)
+                for item in missing:
+                    print(f"- {item}", flush=True)
             run(pipeline_cmd(args, image_path, spec_path, out_path), env, args.dry_run)
         spec_paths.append(spec_path)
         out_paths.append(out_path)
@@ -249,7 +309,13 @@ def main() -> None:
                 run(render_preview_cmd(out_path, preview_path), env, args.dry_run)
 
     if not args.no_combined and not args.dry_run:
-        combine_specs(spec_paths, combined_path)
+        if args.skip_generic_assets:
+            os.environ["SLIDEGEN_ALLOW_NATIVE_ICON_PLACEHOLDERS"] = "1"
+        combine_specs(
+            spec_paths,
+            combined_path,
+            allow_native_icon_placeholders=args.skip_generic_assets,
+        )
         if not args.no_previews:
             run(render_preview_cmd(combined_path, combined_path.with_suffix(".png")), env, args.dry_run)
 

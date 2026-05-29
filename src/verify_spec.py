@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 
@@ -15,6 +16,14 @@ def contains(bbox, point, pad=8):
     x, y, w, h = bbox
     px, py = point
     return x - pad <= px <= x + w + pad and y - pad <= py <= y + h + pad
+
+
+def bool_value(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
 
 
 def logo_refs(spec):
@@ -60,6 +69,16 @@ def generic_asset_refs(spec):
     return refs
 
 
+def existing_asset_path(asset: dict) -> Path | None:
+    path_value = asset.get("path") if isinstance(asset, dict) else None
+    if not path_value:
+        return None
+    path = Path(str(path_value))
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path if path.exists() else None
+
+
 def verify(spec: dict) -> list[str]:
     warnings = []
     if spec.get("layout") not in {"generic_slide", "generic_deck"}:
@@ -69,14 +88,17 @@ def verify(spec: dict) -> list[str]:
     declared_assets = {item.get("name") for item in spec.get("asset_queries", []) if isinstance(item, dict)}
     assets = spec.get("assets", {})
     seen_refs = {}
+    allow_native_icons = bool_value(os.getenv("SLIDEGEN_ALLOW_NATIVE_ICON_PLACEHOLDERS"))
 
     for name, slide_name, element_type in generic_asset_refs(spec):
-        if element_type == "icon":
+        if element_type == "icon" and allow_native_icons:
             continue
         if name not in declared_assets and name not in declared:
             warnings.append(f"{element_type} asset `{name}` is referenced by `{slide_name}` but not declared")
-        if name not in assets:
-            warnings.append(f"{element_type} asset `{name}` is referenced by `{slide_name}` but has no generated/extracted asset")
+        if name not in assets or existing_asset_path(assets.get(name, {})) is None:
+            warnings.append(
+                f"{element_type} asset `{name}` is referenced by `{slide_name}` but has no usable generated/extracted asset"
+            )
 
     for name, container_name, container_bbox in logo_refs(spec):
         seen_refs.setdefault(name, []).append(container_name)
