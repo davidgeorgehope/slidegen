@@ -50,7 +50,7 @@ import numpy as np
 from PIL import Image
 
 try:
-    from openai import OpenAI
+    from xai_client import xai_client
 except ImportError:  # pragma: no cover - optional until description mode is used
     OpenAI = None
 
@@ -68,7 +68,7 @@ VAL_MAX = 232
 MIN_COMPONENT_AREA = 8
 CLUSTER_GAP = 14
 CROP_PAD = 6
-IMAGE_GEN_CLI = Path.home() / ".codex/skills/.system/imagegen/scripts/image_gen.py"
+IMAGE_GEN_CLI = Path(__file__).resolve().parent / "xai_image_cli.py"
 GENERATED_ICON_LIBRARY_DIR = Path(os.getenv("SLIDEGEN_ICON_LIBRARY_DIR", "extracted/generated_icon_library"))
 DEFAULT_ICON_PROMPT_VERSION = "v7"
 CONTAINER_ICON_PROMPT_VERSION = "v8"
@@ -84,7 +84,7 @@ ICON_SOURCE_MATTE_ATTEMPTS = 1
 DEFAULT_ICON_ARTWORK_TARGET_COVERAGE = 0.92
 CONTAINER_ICON_ARTWORK_TARGET_COVERAGE = 0.94
 DEFAULT_ICON_STYLE = "source-matched presentation pictogram"
-DEFAULT_ICON_DESCRIBE_MODEL = "gpt-5.5"
+DEFAULT_ICON_DESCRIBE_MODEL = "grok-4.7"
 ICON_DESCRIPTION_ATTEMPTS = 3
 REGENERATION_QUERY_FIELDS = (
     "regenerate",
@@ -947,7 +947,7 @@ def describe_icon_reference(query: dict, reference: SourceReference) -> str:
     if OpenAI is None:
         raise RuntimeError("openai package is required for description-based icon generation")
     icon_id, label = semantic_icon(query)
-    model = os.environ.get("OPENAI_ICON_DESCRIBE_MODEL") or os.environ.get("OPENAI_SPEC_MODEL") or DEFAULT_ICON_DESCRIBE_MODEL
+    model = os.environ.get("XAI_ICON_DESCRIBE_MODEL") or os.environ.get("XAI_SPEC_MODEL") or DEFAULT_ICON_DESCRIBE_MODEL
     container_context = ""
     if bool_value(query.get("renderer_draws_container", False)):
         container_context = (
@@ -977,7 +977,7 @@ def describe_icon_reference(query: dict, reference: SourceReference) -> str:
         f"Observed spec style hint: {icon_style(query)}. "
         f"{regeneration_guidance_text(query)}"
     )
-    client = OpenAI()
+    client = xai_client()
     for attempt in range(1, ICON_DESCRIPTION_ATTEMPTS + 1):
         attempt_prompt = prompt
         if attempt > 1:
@@ -1136,7 +1136,7 @@ def can_generate_asset(
     _, library_path, _ = generated_library_paths(icon_id, reference.image_hash, icon_prompt_version(query, generation_input))
     if library_path.exists():
         return True
-    return bool(os.getenv("OPENAI_API_KEY"))
+    return bool(os.getenv("XAI_API_KEY"))
 
 
 def generate_asset(
@@ -1168,7 +1168,7 @@ def generate_asset(
         if icon_description
         else generation_prompt(query, reference)
     )
-    model = query.get("generation_model", "gpt-image-2")
+    model = query.get("generation_model", "grok-imagine-image-2.0")
     size = query.get("generation_size", "1024x1024")
     quality = query.get("generation_quality", "medium")
     icon_id, label = semantic_icon(query)
@@ -1261,8 +1261,8 @@ def generate_asset(
         library_path.unlink(missing_ok=True)
         manifest_path.unlink(missing_ok=True)
 
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY is required to generate a missing icon")
+    if not os.getenv("XAI_API_KEY"):
+        raise RuntimeError("XAI_API_KEY is required to generate a missing icon")
     if not IMAGE_GEN_CLI.exists():
         raise RuntimeError(f"Image generation CLI not found: {IMAGE_GEN_CLI}")
 

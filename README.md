@@ -98,24 +98,24 @@ python3 -m venv .venv
 For OpenAI-backed spec generation, create a local `.env` file:
 
 ```bash
-OPENAI_SPEC_MODEL=gpt-5.5
-OPENAI_STRUCTURE_MODEL=gpt-5.5
-OPENAI_REFINE_MODEL=gpt-5.5
-OPENAI_ICON_DESCRIBE_MODEL=gpt-5.5
+XAI_SPEC_MODEL=grok-4.7
+XAI_STRUCTURE_MODEL=grok-4.7
+XAI_REFINE_MODEL=grok-4.7
+XAI_ICON_DESCRIBE_MODEL=grok-4.7
 ```
 
-Set `OPENAI_API_KEY` in that local `.env` file. `.env` is ignored by git.
+Set `XAI_API_KEY` in that local `.env` file. `.env` is ignored by git.
 
 ## Spec Generation Model
 
-`gpt-5.5` is the default model for spec generation. You can override it per run:
+`grok-4.7` is the default model for spec generation. You can override it per run:
 
 ```bash
 .venv/bin/python src/run_pipeline.py \
   images/source.png \
   specs/source.auto.json \
   output/source.pptx \
-  --spec-model gpt-5.5
+  --spec-model grok-4.7
 ```
 
 The spec generator is not OpenAI OCR only. By default it uses Apple Vision OCR
@@ -300,8 +300,8 @@ Useful narrower runs:
   --combined output/helper_tests/helper_test_1_26_27_28.pptx \
   --scratch-dir /private/tmp/slidegen_helper_test \
   --asset-mode generate \
-  --spec-model gpt-5.5 \
-  --refine-model gpt-5.5 \
+  --spec-model grok-4.7 \
+  --refine-model grok-4.7 \
   --style-guide-image "New Brand Mini Style Guide (1).png" \
   --template-pptx "Copy of Obsidian Template Deck 2026.pptx"
 ```

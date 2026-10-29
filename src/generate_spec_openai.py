@@ -18,14 +18,14 @@ from typing import Any
 from PIL import Image
 
 try:
-    from openai import OpenAI
+    from xai_client import xai_client
 except ImportError as exc:  # pragma: no cover - dependency error path
     raise SystemExit("openai package is required: .venv/bin/pip install openai") from exc
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_DIR = ROOT / "prompts" / "spec_generation"
-DEFAULT_SPEC_MODEL = "gpt-5.5"
+DEFAULT_SPEC_MODEL = "grok-4.7"
 DEFAULT_THEME = {
     "bg_color": "F7FBFE",
     "panel_fill": "FFFFFF",
@@ -451,7 +451,7 @@ def generate_spec(
             ]
         )
 
-    client = OpenAI()
+    client = xai_client()
     response = client.responses.create(
         model=model,
         instructions=system_prompt,
@@ -491,7 +491,7 @@ def main() -> None:
     out_path = Path(args.output_spec)
 
     helper_images = [(f"style guide: {Path(path).name}", Path(path)) for path in args.style_guide_image]
-    model = args.model or os.environ.get("OPENAI_SPEC_MODEL") or os.environ.get("OPENAI_MODEL") or DEFAULT_SPEC_MODEL
+    model = args.model or os.environ.get("XAI_SPEC_MODEL") or os.environ.get("XAI_MODEL") or DEFAULT_SPEC_MODEL
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="slidegen_spec_helpers_") as tmp:
         if args.template_pptx:

@@ -13,14 +13,14 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from openai import OpenAI
+    from xai_client import xai_client
 except ImportError as exc:  # pragma: no cover - dependency error path
     raise SystemExit("openai package is required: .venv/bin/pip install openai") from exc
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_PATH = ROOT / "prompts" / "refinement" / "visual_quality.md"
-DEFAULT_REFINE_MODEL = "gpt-5.5"
+DEFAULT_REFINE_MODEL = "grok-4.7"
 
 REFINEMENT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -640,7 +640,7 @@ def request_refinement(
         "Return a quality review and constrained patch list. If the slide is already acceptable, return no patches."
     )
 
-    client = OpenAI()
+    client = xai_client()
     response = client.responses.create(
         model=model,
         instructions="You are a strict visual QA pass for editable slide reconstruction. Return only JSON.",
@@ -680,11 +680,11 @@ def main() -> None:
     args = parser.parse_args()
 
     load_env(ROOT / ".env")
-    if not os.environ.get("OPENAI_API_KEY"):
+    if not os.environ.get("XAI_API_KEY"):
         output = Path(args.output_spec)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(Path(args.spec).read_text())
-        print("refinement skipped: OPENAI_API_KEY is not set")
+        print("refinement skipped: XAI_API_KEY is not set")
         return
 
     spec_path = Path(args.spec)
@@ -696,7 +696,7 @@ def main() -> None:
         print(f"refinement skipped: unsupported layout {spec.get('layout')}")
         return
 
-    model = args.model or os.environ.get("OPENAI_REFINE_MODEL") or os.environ.get("OPENAI_SPEC_MODEL") or DEFAULT_REFINE_MODEL
+    model = args.model or os.environ.get("XAI_REFINE_MODEL") or os.environ.get("XAI_SPEC_MODEL") or DEFAULT_REFINE_MODEL
     lint = lint_spec(spec)
     if lint:
         print("deterministic lint hints:")
