@@ -74,8 +74,8 @@ run_json_task(
 OpenAI implementation:
 
 - Current Responses API behavior.
-- Uses explicit model config such as `OPENAI_SPEC_MODEL`,
-  `OPENAI_STRUCTURE_MODEL`, and `OPENAI_REFINE_MODEL`.
+- Uses explicit model config such as `XAI_SPEC_MODEL`,
+  `XAI_STRUCTURE_MODEL`, and `XAI_REFINE_MODEL`.
 
 Codex CLI implementation:
 

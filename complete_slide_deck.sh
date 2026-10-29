@@ -15,8 +15,8 @@ ICON_GENERATION_INPUT="${ICON_GENERATION_INPUT:-description}"
 SPEC_LAYOUT="${SPEC_LAYOUT:-generic_slide}"
 SPEC_REFINE="${SPEC_REFINE:-1}"
 REFINE="${REFINE:-2}"
-SPEC_MODEL="${SPEC_MODEL:-gpt-5.5}"
-REFINE_MODEL="${REFINE_MODEL:-gpt-5.5}"
+SPEC_MODEL="${SPEC_MODEL:-grok-4.7}"
+REFINE_MODEL="${REFINE_MODEL:-grok-4.7}"
 STYLE_GUIDE_IMAGE="${STYLE_GUIDE_IMAGE:-New Brand Mini Style Guide (1).png}"
 TEMPLATE_PPTX="${TEMPLATE_PPTX:-Copy of Obsidian Template Deck 2026.pptx}"
 COMPACT_FOR_GOOGLE="${COMPACT_FOR_GOOGLE:-1}"
@@ -42,8 +42,8 @@ if (( ${#matched_images[@]} == 0 )); then
   exit 1
 fi
 
-if [[ -z "${OPENAI_API_KEY:-}" ]] && ! grep -q '^OPENAI_API_KEY=' .env 2>/dev/null; then
-  echo "OPENAI_API_KEY is not set in the shell or .env; final-quality generation will fail." >&2
+if [[ -z "${XAI_API_KEY:-}" ]] && ! grep -q '^XAI_API_KEY=' .env 2>/dev/null; then
+  echo "XAI_API_KEY is not set in the shell or .env; final-quality generation will fail." >&2
   exit 1
 fi
 

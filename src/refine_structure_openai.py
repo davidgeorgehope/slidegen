@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from openai import OpenAI
+    from xai_client import xai_client
 except ImportError as exc:  # pragma: no cover - dependency error path
     raise SystemExit("openai package is required: .venv/bin/pip install openai") from exc
 
@@ -81,7 +81,7 @@ def request_structure_refinement(
             ]
         )
 
-    client = OpenAI()
+    client = xai_client()
     response = client.responses.create(
         model=model,
         instructions="You are a strict structural QA pass for editable slide reconstruction. Return only JSON.",
@@ -129,7 +129,7 @@ def main() -> None:
         return
 
     validate_spec(spec)
-    model = args.model or os.environ.get("OPENAI_STRUCTURE_MODEL") or os.environ.get("OPENAI_SPEC_MODEL") or DEFAULT_SPEC_MODEL
+    model = args.model or os.environ.get("XAI_STRUCTURE_MODEL") or os.environ.get("XAI_SPEC_MODEL") or DEFAULT_SPEC_MODEL
     rendered_preview = Path(args.rendered_preview) if args.rendered_preview else None
     response = request_structure_refinement(Path(args.source_image), spec, model=model, rendered_preview=rendered_preview)
     response, filtered_rejections = keep_structural_patches(response)

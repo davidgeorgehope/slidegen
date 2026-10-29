@@ -253,7 +253,7 @@ def main() -> None:
         default="generic_slide",
         help="layout to request from spec generation",
     )
-    parser.add_argument("--spec-model", default=None, help="OpenAI model for spec generation")
+    parser.add_argument("--spec-model", default=None, help="xAI model for spec generation")
     parser.add_argument(
         "--spec-refine",
         type=int,
@@ -268,7 +268,7 @@ def main() -> None:
         default=2,
         help="render/preview/critique refinement iterations; use 0 for fast layout-only runs",
     )
-    parser.add_argument("--refine-model", default=None, help="OpenAI model for refinement critique")
+    parser.add_argument("--refine-model", default=None, help="xAI model for refinement critique")
     parser.add_argument("--no-verify", action="store_true", help="skip non-fatal generated spec verification")
     parser.add_argument("--skip-assets", action="store_true")
     parser.add_argument("--extract-root", default=None, help="scratch root for extracted logos and generated assets")
